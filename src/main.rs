@@ -4,6 +4,7 @@ mod git;
 mod highlight;
 mod input;
 mod settings;
+mod terminal;
 mod ui;
 
 use std::io;
@@ -50,18 +51,31 @@ fn run_app(
     app: &mut App,
     highlighter: &Highlighter,
 ) -> Result<()> {
-    let poll_timeout = Duration::from_millis(120);
+    let poll_timeout_idle = Duration::from_millis(80);
+    let poll_timeout_terminal = Duration::from_millis(8);
+    let drain_timeout = Duration::from_millis(0);
 
     loop {
+        app.tick();
         terminal.draw(|frame| ui::render(frame, app, highlighter))?;
 
-        if event::poll(poll_timeout)? {
-            let next_event = event::read()?;
-            if !input::handle_event(app, next_event) {
-                break;
+        let timeout = if app.terminal_open {
+            poll_timeout_terminal
+        } else {
+            poll_timeout_idle
+        };
+
+        if event::poll(timeout)? {
+            loop {
+                let next_event = event::read()?;
+                if !input::handle_event(app, next_event) {
+                    return Ok(());
+                }
+
+                if !event::poll(drain_timeout)? {
+                    break;
+                }
             }
         }
     }
-
-    Ok(())
 }

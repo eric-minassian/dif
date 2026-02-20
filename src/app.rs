@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
-use crate::diff::{parse_unified_diff, DiffRow};
+use crate::diff::{DiffRow, parse_unified_diff};
 use crate::git::{self, DiffMode, FileEntry, UnstagedKind};
 use crate::settings::{
-    self, AppSettings, DiffViewMode, AUTO_SPLIT_MIN_WIDTH_MAX, AUTO_SPLIT_MIN_WIDTH_MIN,
+    self, AUTO_SPLIT_MIN_WIDTH_MAX, AUTO_SPLIT_MIN_WIDTH_MIN, AppSettings, DiffViewMode,
     SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
 };
+use crate::terminal::{TerminalSession, TerminalStyledRow};
 
 const SETTINGS_FIELD_COUNT: usize = 6;
 
@@ -16,6 +18,12 @@ const SETTINGS_FIELD_COUNT: usize = 6;
 pub enum FocusSection {
     Unstaged,
     Staged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneFocus {
+    Sidebar,
+    Diff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +65,22 @@ pub struct App {
     pub settings: AppSettings,
     pub settings_open: bool,
     pub settings_selected: usize,
+    pub terminal_open: bool,
+    pub terminal_scrollback: usize,
+    pub terminal_copy_mode: bool,
+    pub terminal_search_open: bool,
+    pub terminal_search_query: String,
+    terminal_last_search: String,
+    terminal_cursor_row: usize,
+    terminal_cursor_col: usize,
+    terminal_selection_anchor: Option<(usize, usize)>,
+    terminal_view_rows: usize,
+    terminal_view_cols: usize,
+    terminal_session: Option<TerminalSession>,
     pub unstaged: Vec<FileEntry>,
     pub staged: Vec<String>,
     pub focus: FocusSection,
+    pub pane_focus: PaneFocus,
     pub unstaged_selected: Option<usize>,
     pub staged_selected: Option<usize>,
     pub unstaged_scroll: usize,
@@ -86,9 +107,22 @@ impl App {
             settings,
             settings_open: false,
             settings_selected: 0,
+            terminal_open: false,
+            terminal_scrollback: 0,
+            terminal_copy_mode: false,
+            terminal_search_open: false,
+            terminal_search_query: String::new(),
+            terminal_last_search: String::new(),
+            terminal_cursor_row: 0,
+            terminal_cursor_col: 0,
+            terminal_selection_anchor: None,
+            terminal_view_rows: 0,
+            terminal_view_cols: 0,
+            terminal_session: None,
             unstaged: Vec::new(),
             staged: Vec::new(),
             focus: FocusSection::Unstaged,
+            pane_focus: PaneFocus::Sidebar,
             unstaged_selected: None,
             staged_selected: None,
             unstaged_scroll: 0,
@@ -124,6 +158,28 @@ impl App {
         self.load_current_diff()?;
 
         Ok(())
+    }
+
+    pub fn tick(&mut self) {
+        let mut exit_message = None;
+
+        if let Some(session) = self.terminal_session.as_mut() {
+            session.pump_output();
+
+            match session.poll_exit_message() {
+                Ok(message) => exit_message = message,
+                Err(error) => self.status_line = format!("Error: {error}"),
+            }
+
+            if self.terminal_scrollback > 0 {
+                session.set_scrollback(self.terminal_scrollback);
+                self.terminal_scrollback = session.scrollback();
+            }
+        }
+
+        if let Some(message) = exit_message {
+            self.status_line = format!("Terminal session ended: {message}");
+        }
     }
 
     pub fn switch_focus(&mut self) -> Result<()> {
@@ -210,6 +266,9 @@ impl App {
 
     pub fn toggle_sidebar_visibility(&mut self) -> Result<()> {
         self.settings.sidebar_visible = !self.settings.sidebar_visible;
+        if !self.settings.sidebar_visible {
+            self.pane_focus = PaneFocus::Diff;
+        }
         self.persist_settings()?;
         self.status_line = if self.settings.sidebar_visible {
             String::from("Sidebar shown")
@@ -238,7 +297,330 @@ impl App {
         Ok(())
     }
 
+    pub fn open_terminal(&mut self) -> Result<()> {
+        self.settings_open = false;
+        self.terminal_open = true;
+        self.terminal_copy_mode = false;
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.terminal_selection_anchor = None;
+        self.terminal_cursor_row = 0;
+        self.terminal_cursor_col = 0;
+        self.terminal_scrollback = 0;
+
+        self.ensure_live_terminal_session()?;
+        if let Some(session) = self.terminal_session.as_mut() {
+            session.set_scrollback(0);
+            session.pump_output();
+            self.terminal_scrollback = session.scrollback();
+        }
+
+        self.status_line = String::from("Terminal open (interactive)");
+        Ok(())
+    }
+
+    pub fn close_terminal(&mut self) {
+        if self.terminal_open {
+            self.terminal_open = false;
+            self.terminal_copy_mode = false;
+            self.terminal_search_open = false;
+            self.terminal_search_query.clear();
+            self.terminal_selection_anchor = None;
+            self.terminal_scrollback = 0;
+            self.terminal_cursor_row = 0;
+            self.terminal_cursor_col = 0;
+            self.terminal_view_rows = 0;
+            self.terminal_view_cols = 0;
+            self.terminal_session = None;
+            self.status_line = String::from("Terminal closed");
+            if let Err(error) = self.refresh() {
+                self.status_line = format!("Error: {error}");
+            }
+        }
+    }
+
+    pub fn terminal_send_key(&mut self, key: KeyEvent) -> Result<()> {
+        let session = self.ensure_live_terminal_session()?;
+        session.send_key(key)?;
+        session.pump_output();
+        self.terminal_scrollback = session.scrollback();
+        Ok(())
+    }
+
+    pub fn terminal_send_text(&mut self, text: &str) -> Result<()> {
+        let session = self.ensure_live_terminal_session()?;
+        session.send_text(text)?;
+        session.pump_output();
+        self.terminal_scrollback = session.scrollback();
+        Ok(())
+    }
+
+    pub fn terminal_resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        if let Some(session) = self.terminal_session.as_mut() {
+            session.resize(rows, cols)?;
+        }
+        Ok(())
+    }
+
+    pub fn terminal_rows(&self) -> Vec<TerminalStyledRow> {
+        self.terminal_session
+            .as_ref()
+            .map(TerminalSession::styled_rows)
+            .unwrap_or_default()
+    }
+
+    pub fn terminal_plain_rows(&self) -> Vec<String> {
+        self.terminal_session
+            .as_ref()
+            .map(TerminalSession::plain_rows)
+            .unwrap_or_default()
+    }
+
+    pub fn scroll_terminal(&mut self, delta: isize) {
+        let Some(session) = self.terminal_session.as_mut() else {
+            return;
+        };
+
+        let target = if delta < 0 {
+            self.terminal_scrollback
+                .saturating_sub(delta.unsigned_abs())
+        } else {
+            self.terminal_scrollback.saturating_add(delta as usize)
+        };
+
+        session.set_scrollback(target);
+        self.terminal_scrollback = session.scrollback();
+
+        let max_row = self.terminal_view_rows.saturating_sub(1);
+        self.terminal_cursor_row = self.terminal_cursor_row.min(max_row);
+    }
+
+    pub fn set_terminal_viewport(&mut self, rows: usize, cols: usize) -> Result<()> {
+        self.terminal_view_rows = rows;
+        self.terminal_view_cols = cols;
+        self.terminal_cursor_row = self.terminal_cursor_row.min(rows.saturating_sub(1));
+        self.terminal_cursor_col = self.terminal_cursor_col.min(cols.saturating_sub(1));
+        self.terminal_resize(rows as u16, cols as u16)
+    }
+
+    pub fn terminal_enter_copy_mode(&mut self) {
+        self.terminal_copy_mode = true;
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.terminal_selection_anchor = None;
+        self.terminal_cursor_row = self.terminal_view_rows.saturating_sub(1);
+        self.terminal_cursor_col = 0;
+        self.status_line = String::from("Copy mode");
+    }
+
+    pub fn terminal_exit_copy_mode(&mut self) {
+        if self.terminal_copy_mode {
+            self.terminal_copy_mode = false;
+            self.terminal_search_open = false;
+            self.terminal_search_query.clear();
+            self.terminal_selection_anchor = None;
+            self.status_line = String::from("Terminal interactive mode");
+        }
+    }
+
+    pub fn terminal_move_cursor(&mut self, row_delta: isize, col_delta: isize) {
+        if row_delta != 0 {
+            if row_delta < 0 {
+                for _ in 0..row_delta.unsigned_abs() {
+                    if self.terminal_cursor_row > 0 {
+                        self.terminal_cursor_row -= 1;
+                    } else {
+                        self.scroll_terminal(1);
+                    }
+                }
+            } else {
+                for _ in 0..row_delta as usize {
+                    let max_row = self.terminal_view_rows.saturating_sub(1);
+                    if self.terminal_cursor_row < max_row {
+                        self.terminal_cursor_row += 1;
+                    } else if self.terminal_scrollback > 0 {
+                        self.scroll_terminal(-1);
+                    }
+                }
+            }
+        }
+
+        if col_delta < 0 {
+            self.terminal_cursor_col = self
+                .terminal_cursor_col
+                .saturating_sub(col_delta.unsigned_abs());
+        } else if col_delta > 0 {
+            self.terminal_cursor_col = self
+                .terminal_cursor_col
+                .saturating_add(col_delta as usize)
+                .min(self.terminal_view_cols.saturating_sub(1));
+        }
+    }
+
+    pub fn terminal_toggle_selection_anchor(&mut self) {
+        if self.terminal_selection_anchor.is_some() {
+            self.terminal_selection_anchor = None;
+            self.status_line = String::from("Selection cleared");
+        } else {
+            self.terminal_selection_anchor =
+                Some((self.terminal_cursor_row, self.terminal_cursor_col));
+            self.status_line = String::from("Selection anchor set");
+        }
+    }
+
+    pub fn terminal_yank_selection(&mut self) -> Result<()> {
+        let Some(anchor) = self.terminal_selection_anchor else {
+            self.status_line = String::from("No selection anchor; press v first");
+            return Ok(());
+        };
+
+        let rows = self.terminal_plain_rows();
+        if rows.is_empty() {
+            self.status_line = String::from("Nothing to copy");
+            return Ok(());
+        }
+
+        let cursor = (self.terminal_cursor_row, self.terminal_cursor_col);
+        let ((start_row, start_col), (end_row, end_col)) = order_positions(anchor, cursor);
+
+        let mut out = String::new();
+        for row_idx in start_row..=end_row {
+            let line = rows.get(row_idx).map(String::as_str).unwrap_or("");
+            let chars = line.chars().collect::<Vec<_>>();
+
+            let from = if row_idx == start_row {
+                start_col.min(chars.len())
+            } else {
+                0
+            };
+            let to_exclusive = if row_idx == end_row {
+                end_col.saturating_add(1).min(chars.len())
+            } else {
+                chars.len()
+            };
+
+            if from < to_exclusive {
+                out.extend(chars[from..to_exclusive].iter());
+            }
+
+            if row_idx < end_row {
+                out.push('\n');
+            }
+        }
+
+        if out.is_empty() {
+            self.status_line = String::from("Selection is empty");
+            return Ok(());
+        }
+
+        let mut clipboard =
+            arboard::Clipboard::new().context("failed to access system clipboard")?;
+        clipboard
+            .set_text(out.clone())
+            .context("failed to copy selection to clipboard")?;
+
+        self.status_line = format!("Copied {} chars", out.chars().count());
+        self.terminal_selection_anchor = None;
+        Ok(())
+    }
+
+    pub fn terminal_open_search(&mut self) {
+        self.terminal_search_open = true;
+        self.terminal_search_query = self.terminal_last_search.clone();
+    }
+
+    pub fn terminal_cancel_search(&mut self) {
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.status_line = String::from("Search cancelled");
+    }
+
+    pub fn terminal_search_append(&mut self, ch: char) {
+        self.terminal_search_query.push(ch);
+    }
+
+    pub fn terminal_search_backspace(&mut self) {
+        self.terminal_search_query.pop();
+    }
+
+    pub fn terminal_search_next(&mut self) {
+        let query = if self.terminal_search_open {
+            self.terminal_search_query.trim().to_owned()
+        } else {
+            self.terminal_last_search.trim().to_owned()
+        };
+
+        if query.is_empty() {
+            self.status_line = String::from("Search query is empty");
+            self.terminal_search_open = false;
+            return;
+        }
+
+        self.terminal_last_search = query.clone();
+        self.terminal_search_open = false;
+
+        let rows = self.terminal_plain_rows();
+        if rows.is_empty() {
+            self.status_line = String::from("No terminal output to search");
+            return;
+        }
+
+        let start_row = self.terminal_cursor_row.min(rows.len().saturating_sub(1));
+        let start_col = self.terminal_cursor_col.saturating_add(1);
+
+        let mut found = None;
+
+        for pass in 0..2 {
+            let row_iter: Box<dyn Iterator<Item = usize>> = if pass == 0 {
+                Box::new(start_row..rows.len())
+            } else {
+                Box::new(0..start_row)
+            };
+
+            for row_idx in row_iter {
+                let col_start = if pass == 0 && row_idx == start_row {
+                    start_col
+                } else {
+                    0
+                };
+                if let Some(col_idx) = find_query_in_line(&rows[row_idx], &query, col_start) {
+                    found = Some((row_idx, col_idx));
+                    break;
+                }
+            }
+
+            if found.is_some() {
+                break;
+            }
+        }
+
+        if let Some((row_idx, col_idx)) = found {
+            self.terminal_cursor_row = row_idx.min(self.terminal_view_rows.saturating_sub(1));
+            self.terminal_cursor_col = col_idx.min(self.terminal_view_cols.saturating_sub(1));
+            self.status_line = format!("Found `{}`", query);
+        } else {
+            self.status_line = format!("No match for `{}`", query);
+        }
+    }
+
+    pub fn terminal_cursor(&self) -> (usize, usize) {
+        (self.terminal_cursor_row, self.terminal_cursor_col)
+    }
+
+    pub fn terminal_selection_rows(&self) -> Option<(usize, usize)> {
+        self.terminal_selection_anchor.map(|(anchor_row, _)| {
+            let start = anchor_row.min(self.terminal_cursor_row);
+            let end = anchor_row.max(self.terminal_cursor_row);
+            (start, end)
+        })
+    }
+
     pub fn toggle_settings_panel(&mut self) {
+        self.terminal_open = false;
+        self.terminal_copy_mode = false;
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.terminal_selection_anchor = None;
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.status_line = String::from("Settings open");
@@ -383,8 +765,15 @@ impl App {
         }
     }
 
+    pub fn repo_root_display(&self) -> String {
+        self.repo_root.display().to_string()
+    }
+
     pub fn set_layout(&mut self, layout: UiLayout) {
         self.layout = layout;
+        if !self.has_sidebar() {
+            self.pane_focus = PaneFocus::Diff;
+        }
     }
 
     pub fn set_diff_content_height(&mut self, content_height: usize) {
@@ -426,8 +815,25 @@ impl App {
         self.sync_scrolls();
     }
 
+    pub fn is_diff_focused(&self) -> bool {
+        self.pane_focus == PaneFocus::Diff
+    }
+
+    pub fn toggle_pane_focus(&mut self) {
+        if !self.has_sidebar() {
+            self.pane_focus = PaneFocus::Diff;
+            return;
+        }
+
+        self.pane_focus = match self.pane_focus {
+            PaneFocus::Sidebar => PaneFocus::Diff,
+            PaneFocus::Diff => PaneFocus::Sidebar,
+        };
+    }
+
     pub fn click(&mut self, column: u16, row: u16) -> Result<()> {
         if contains(self.layout.unstaged_inner, column, row) {
+            self.pane_focus = PaneFocus::Sidebar;
             self.focus = FocusSection::Unstaged;
             let offset = (row - self.layout.unstaged_inner.y) as usize;
             let idx = self.unstaged_scroll + offset;
@@ -439,6 +845,7 @@ impl App {
         }
 
         if contains(self.layout.staged_inner, column, row) {
+            self.pane_focus = PaneFocus::Sidebar;
             self.focus = FocusSection::Staged;
             let offset = (row - self.layout.staged_inner.y) as usize;
             let idx = self.staged_scroll + offset;
@@ -446,6 +853,11 @@ impl App {
                 self.staged_selected = Some(idx);
             }
             self.load_current_diff()?;
+            return Ok(());
+        }
+
+        if contains(self.layout.diff_area, column, row) {
+            self.pane_focus = PaneFocus::Diff;
         }
 
         Ok(())
@@ -482,6 +894,28 @@ impl App {
         Ok(())
     }
 
+    fn ensure_live_terminal_session(&mut self) -> Result<&mut TerminalSession> {
+        let must_start = self
+            .terminal_session
+            .as_ref()
+            .map(|session| session.is_exited())
+            .unwrap_or(true);
+
+        if must_start {
+            self.terminal_session = Some(TerminalSession::start(&self.repo_root, 24, 80)?);
+            self.terminal_scrollback = 0;
+        }
+
+        Ok(self
+            .terminal_session
+            .as_mut()
+            .expect("terminal session should exist after ensure"))
+    }
+
+    fn has_sidebar(&self) -> bool {
+        self.layout.unstaged_inner.width > 0 || self.layout.staged_inner.width > 0
+    }
+
     fn selected_unstaged(&self) -> Option<&FileEntry> {
         self.unstaged_selected
             .and_then(|idx| self.unstaged.get(idx))
@@ -503,17 +937,17 @@ impl App {
             return;
         }
 
-        if let Some(path) = preferred_path {
-            if let Some(idx) = self.unstaged.iter().position(|entry| entry.path == path) {
-                self.unstaged_selected = Some(idx);
-                return;
-            }
+        if let Some(path) = preferred_path
+            && let Some(idx) = self.unstaged.iter().position(|entry| entry.path == path)
+        {
+            self.unstaged_selected = Some(idx);
+            return;
         }
 
-        if let Some(idx) = self.unstaged_selected {
-            if idx < self.unstaged.len() {
-                return;
-            }
+        if let Some(idx) = self.unstaged_selected
+            && idx < self.unstaged.len()
+        {
+            return;
         }
 
         self.unstaged_selected = Some(0);
@@ -526,17 +960,17 @@ impl App {
             return;
         }
 
-        if let Some(path) = preferred_path {
-            if let Some(idx) = self.staged.iter().position(|entry| entry == &path) {
-                self.staged_selected = Some(idx);
-                return;
-            }
+        if let Some(path) = preferred_path
+            && let Some(idx) = self.staged.iter().position(|entry| entry == &path)
+        {
+            self.staged_selected = Some(idx);
+            return;
         }
 
-        if let Some(idx) = self.staged_selected {
-            if idx < self.staged.len() {
-                return;
-            }
+        if let Some(idx) = self.staged_selected
+            && idx < self.staged.len()
+        {
+            return;
         }
 
         self.staged_selected = Some(0);
@@ -631,4 +1065,34 @@ fn ensure_visible(selected: Option<usize>, len: usize, visible: usize, scroll: &
 fn shift_and_clamp_u16(value: u16, delta: isize, step: u16, min: u16, max: u16) -> u16 {
     let candidate = value as i32 + (delta as i32 * step as i32);
     candidate.clamp(min as i32, max as i32) as u16
+}
+
+fn order_positions(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn find_query_in_line(line: &str, query: &str, start_col: usize) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let line_chars = line.chars().collect::<Vec<_>>();
+    let query_chars = query.chars().collect::<Vec<_>>();
+
+    if query_chars.len() > line_chars.len() {
+        return None;
+    }
+
+    let from = start_col.min(line_chars.len());
+    for idx in from..=line_chars.len().saturating_sub(query_chars.len()) {
+        if line_chars[idx..idx + query_chars.len()] == query_chars[..] {
+            return Some(idx);
+        }
+    }
+
+    None
 }

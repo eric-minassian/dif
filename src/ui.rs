@@ -4,11 +4,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::app::{App, FocusSection, ResolvedDiffLayout, UiLayout};
+use crate::app::{App, FocusSection, PaneFocus, ResolvedDiffLayout, UiLayout};
 use crate::diff::{CellKind, DiffCell, DiffRow};
 use crate::git::UnstagedKind;
 use crate::highlight::Highlighter;
 use crate::settings::{self, AppTheme, SidebarPosition};
+use crate::terminal::{TerminalCellStyle, TerminalStyledRow};
+use vt100::Color as VtColor;
 
 const MIN_DIFF_WIDTH_WITH_SIDEBAR: u16 = 48;
 
@@ -143,7 +145,9 @@ pub fn render(frame: &mut Frame, app: &mut App, highlighter: &Highlighter) {
 
     render_footer(frame, app, footer_area, &palette);
 
-    if app.settings_open {
+    if app.terminal_open {
+        render_terminal_modal(frame, app, root, &palette);
+    } else if app.settings_open {
         render_settings_modal(frame, app, root, &palette);
     }
 }
@@ -185,7 +189,7 @@ fn split_main_area(area: Rect, app: &App) -> (Option<Rect>, Rect) {
 }
 
 fn render_unstaged(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
-    let focused = app.focus == FocusSection::Unstaged;
+    let focused = app.pane_focus == PaneFocus::Sidebar && app.focus == FocusSection::Unstaged;
     let title = format!(" Unstaged ({}) ", app.unstaged.len());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -237,7 +241,7 @@ fn render_unstaged(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) 
 }
 
 fn render_staged(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
-    let focused = app.focus == FocusSection::Staged;
+    let focused = app.pane_focus == PaneFocus::Sidebar && app.focus == FocusSection::Staged;
     let title = format!(" Staged ({}) ", app.staged.len());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -355,13 +359,28 @@ fn render_split_diff_panes(
     let pane_style = Style::default()
         .fg(rgb(palette.text))
         .bg(rgb(palette.pane_bg));
+    let diff_border = if app.pane_focus == PaneFocus::Diff {
+        Style::default().fg(rgb(palette.border_focus))
+    } else {
+        Style::default().fg(rgb(palette.border))
+    };
 
     let old = Paragraph::new(Text::from(old_lines))
-        .block(Block::default().borders(Borders::ALL).title(" Old "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Old ")
+                .border_style(diff_border),
+        )
         .style(pane_style)
         .scroll((scroll, 0));
     let new = Paragraph::new(Text::from(new_lines))
-        .block(Block::default().borders(Borders::ALL).title(" New "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" New ")
+                .border_style(diff_border),
+        )
         .style(pane_style)
         .scroll((scroll, 0));
 
@@ -420,8 +439,18 @@ fn render_unified_diff_pane(
     let pane_style = Style::default()
         .fg(rgb(palette.text))
         .bg(rgb(palette.pane_bg));
+    let diff_border = if app.pane_focus == PaneFocus::Diff {
+        Style::default().fg(rgb(palette.border_focus))
+    } else {
+        Style::default().fg(rgb(palette.border))
+    };
     let paragraph = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title(" Diff "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Diff ")
+                .border_style(diff_border),
+        )
         .style(pane_style)
         .scroll((scroll, 0));
 
@@ -429,15 +458,222 @@ fn render_unified_diff_pane(
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
-    let hint = if app.settings_open {
-        "settings: Esc/Enter/o close  j/k select  h/l change"
+    let hint = if app.terminal_open && app.terminal_search_open {
+        "terminal search: type query, Enter find, Esc cancel"
+    } else if app.terminal_open && app.terminal_copy_mode {
+        "copy mode: move(hjkl/arrows)  v mark  y copy  / search  n next  i interactive"
+    } else if app.terminal_open {
+        "terminal: all keys -> shell, Alt+c copy mode, Ctrl+]/Ctrl+g/Ctrl+q close"
+    } else if app.settings_open {
+        "settings: j/k select, h/l change, Esc close"
     } else {
-        "j/k move  Tab switch  s stage  u unstage  v view  b sidebar  [/] width  o settings  r refresh  q quit"
+        "Tab list  Left/Right pane  Up/Down move-or-scroll  s stage  u unstage  : terminal  o settings  q quit"
     };
 
     let text = format!("{} | {hint}", app.status_line);
     let footer = Paragraph::new(text).style(Style::default().fg(rgb(palette.footer)));
     frame.render_widget(footer, area);
+}
+
+fn render_terminal_modal(frame: &mut Frame, app: &mut App, area: Rect, palette: &Palette) {
+    let popup = centered_rect(92, 82, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Terminal ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(rgb(palette.modal_border)))
+        .style(
+            Style::default()
+                .bg(rgb(palette.modal_bg))
+                .fg(rgb(palette.text)),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let (cursor_row, cursor_col) = app.terminal_cursor();
+    let mode = if app.terminal_copy_mode {
+        "COPY"
+    } else {
+        "SHELL"
+    };
+    let selection = app
+        .terminal_selection_rows()
+        .map(|(start, end)| format!("  |  sel rows: {}-{}", start + 1, end + 1))
+        .unwrap_or_default();
+
+    let header = Paragraph::new(format!(
+        "repo: {}  |  mode: {}  |  scrollback: {}  |  cursor: {}:{}{}",
+        app.repo_root_display(),
+        mode,
+        app.terminal_scrollback,
+        cursor_row + 1,
+        cursor_col + 1,
+        selection
+    ))
+    .style(Style::default().fg(rgb(palette.dim)));
+    frame.render_widget(header, sections[0]);
+
+    if sections[1].width > 0
+        && sections[1].height > 0
+        && let Err(error) =
+            app.set_terminal_viewport(sections[1].height as usize, sections[1].width as usize)
+    {
+        app.set_error(error);
+    }
+
+    let terminal_rows = app.terminal_rows();
+    let output_lines: Vec<Line<'static>> = if terminal_rows.is_empty() {
+        vec![Line::styled(
+            "(waiting for terminal output)",
+            Style::default().fg(rgb(palette.dim)),
+        )]
+    } else {
+        terminal_rows
+            .into_iter()
+            .enumerate()
+            .map(|(row_idx, row)| terminal_row_to_line(row, row_idx, app, palette))
+            .collect()
+    };
+
+    let output =
+        Paragraph::new(Text::from(output_lines)).style(Style::default().bg(rgb(palette.modal_bg)));
+    frame.render_widget(output, sections[1]);
+
+    let help = if app.terminal_search_open {
+        Paragraph::new(format!("/{}_", app.terminal_search_query))
+            .style(Style::default().fg(rgb(palette.text)))
+    } else if app.terminal_copy_mode {
+        Paragraph::new("copy: hjkl/arrows move  v mark  y yank  / search  n next  i interactive")
+            .style(Style::default().fg(rgb(palette.dim)))
+    } else {
+        Paragraph::new(
+            "interactive shell (zsh aliases supported). Alt+c enters copy mode. Ctrl+], Ctrl+g, or Ctrl+q closes.",
+        )
+        .style(Style::default().fg(rgb(palette.dim)))
+    };
+    frame.render_widget(help, sections[2]);
+}
+
+fn terminal_row_to_line(
+    row: TerminalStyledRow,
+    row_idx: usize,
+    app: &App,
+    palette: &Palette,
+) -> Line<'static> {
+    if row.is_empty() {
+        let mut empty = Line::from(Span::raw(String::new()));
+        if app.terminal_copy_mode {
+            let (cursor_row, _) = app.terminal_cursor();
+            if row_idx == cursor_row {
+                empty = empty.style(Style::default().bg(rgb(palette.selected_bg_focused)));
+            }
+        }
+        return empty;
+    }
+
+    let spans = row
+        .into_iter()
+        .map(|span| {
+            let style = style_from_terminal_cell(span.style, palette);
+            Span::styled(span.text, style)
+        })
+        .collect::<Vec<_>>();
+
+    let mut line = Line::from(spans);
+    if app.terminal_copy_mode {
+        if let Some((start, end)) = app.terminal_selection_rows()
+            && row_idx >= start
+            && row_idx <= end
+        {
+            line = line.style(Style::default().bg(rgb(palette.selected_bg_unfocused)));
+        }
+
+        let (cursor_row, _) = app.terminal_cursor();
+        if row_idx == cursor_row {
+            line = line.style(Style::default().bg(rgb(palette.selected_bg_focused)));
+        }
+    }
+
+    line
+}
+
+fn style_from_terminal_cell(style: TerminalCellStyle, palette: &Palette) -> Style {
+    let default_fg = rgb(palette.text);
+    let default_bg = rgb(palette.modal_bg);
+    let mut fg = vt_color_to_tui(style.fg, default_fg);
+    let mut bg = vt_color_to_tui(style.bg, default_bg);
+
+    if style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+
+    let mut resolved = Style::default().fg(fg).bg(bg);
+    if style.bold {
+        resolved = resolved.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        resolved = resolved.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        resolved = resolved.add_modifier(Modifier::UNDERLINED);
+    }
+
+    resolved
+}
+
+fn vt_color_to_tui(color: VtColor, default: Color) -> Color {
+    match color {
+        VtColor::Default => default,
+        VtColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        VtColor::Idx(idx) => indexed_color(idx),
+    }
+}
+
+fn indexed_color(idx: u8) -> Color {
+    match idx {
+        0 => Color::Rgb(0, 0, 0),
+        1 => Color::Rgb(205, 49, 49),
+        2 => Color::Rgb(13, 188, 121),
+        3 => Color::Rgb(229, 229, 16),
+        4 => Color::Rgb(36, 114, 200),
+        5 => Color::Rgb(188, 63, 188),
+        6 => Color::Rgb(17, 168, 205),
+        7 => Color::Rgb(229, 229, 229),
+        8 => Color::Rgb(102, 102, 102),
+        9 => Color::Rgb(241, 76, 76),
+        10 => Color::Rgb(35, 209, 139),
+        11 => Color::Rgb(245, 245, 67),
+        12 => Color::Rgb(59, 142, 234),
+        13 => Color::Rgb(214, 112, 214),
+        14 => Color::Rgb(41, 184, 219),
+        15 => Color::Rgb(255, 255, 255),
+        16..=231 => {
+            let index = idx - 16;
+            let r = index / 36;
+            let g = (index % 36) / 6;
+            let b = index % 6;
+
+            let channel = |value: u8| {
+                if value == 0 { 0 } else { value * 40 + 55 }
+            };
+
+            Color::Rgb(channel(r), channel(g), channel(b))
+        }
+        232..=255 => {
+            let gray = (idx - 232) * 10 + 8;
+            Color::Rgb(gray, gray, gray)
+        }
+    }
 }
 
 fn render_settings_modal(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {

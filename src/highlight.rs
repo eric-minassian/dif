@@ -108,10 +108,10 @@ impl Highlighter {
         };
 
         let file_path = Path::new(path);
-        if let Some(ext) = file_path.extension().and_then(|value| value.to_str()) {
-            if let Some(syntax) = self.syntax_set.find_syntax_by_extension(ext) {
-                return syntax;
-            }
+        if let Some(ext) = file_path.extension().and_then(|value| value.to_str())
+            && let Some(syntax) = self.syntax_set.find_syntax_by_extension(ext)
+        {
+            return syntax;
         }
 
         plain
