@@ -113,6 +113,20 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<DiffRow> {
     rows
 }
 
+pub fn unified_line_count(rows: &[DiffRow]) -> usize {
+    rows.iter()
+        .map(|row| match (&row.old, &row.new) {
+            (Some(old), Some(new))
+                if old.kind == CellKind::Removed && new.kind == CellKind::Added =>
+            {
+                2
+            }
+            (None, None) => 0,
+            _ => 1,
+        })
+        .sum()
+}
+
 fn flush_change_run(
     rows: &mut Vec<DiffRow>,
     removed_run: &mut Vec<DiffCell>,
@@ -158,7 +172,7 @@ fn normalize_line_no(raw: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CellKind, parse_unified_diff};
+    use super::{CellKind, DiffCell, DiffRow, parse_unified_diff, unified_line_count};
 
     #[test]
     fn aligns_replaced_line_blocks() {
@@ -196,5 +210,37 @@ mod tests {
         assert_eq!(rows[1].new.as_ref().map(|c| c.kind), Some(CellKind::Added));
         assert_eq!(rows[2].old, None);
         assert_eq!(rows[2].new.as_ref().map(|c| c.kind), Some(CellKind::Added));
+    }
+
+    #[test]
+    fn counts_unified_rows_with_replacements_as_two_lines() {
+        let rows = vec![
+            DiffRow {
+                old: Some(DiffCell {
+                    line_no: Some(1),
+                    text: String::from("old"),
+                    kind: CellKind::Removed,
+                }),
+                new: Some(DiffCell {
+                    line_no: Some(1),
+                    text: String::from("new"),
+                    kind: CellKind::Added,
+                }),
+            },
+            DiffRow {
+                old: Some(DiffCell {
+                    line_no: Some(2),
+                    text: String::from("same"),
+                    kind: CellKind::Context,
+                }),
+                new: Some(DiffCell {
+                    line_no: Some(2),
+                    text: String::from("same"),
+                    kind: CellKind::Context,
+                }),
+            },
+        ];
+
+        assert_eq!(unified_line_count(&rows), 3);
     }
 }

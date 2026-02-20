@@ -39,6 +39,11 @@ pub struct TerminalSession {
     exited: bool,
 }
 
+struct ShellCommand {
+    program: String,
+    args: Vec<String>,
+}
+
 impl TerminalSession {
     pub fn start(cwd: &Path, rows: u16, cols: u16) -> Result<Self> {
         let pty_system = native_pty_system();
@@ -49,8 +54,11 @@ impl TerminalSession {
             pixel_height: 0,
         })?;
 
-        let mut command = CommandBuilder::new(shell_program());
-        command.arg("-i");
+        let shell = shell_command();
+        let mut command = CommandBuilder::new(shell.program);
+        for arg in shell.args {
+            command.arg(arg);
+        }
         command.cwd(cwd);
 
         let child = pair
@@ -236,23 +244,63 @@ impl Drop for TerminalSession {
     }
 }
 
-fn shell_program() -> String {
+fn shell_command() -> ShellCommand {
     let env_shell = env::var("SHELL").ok().filter(|value| !value.is_empty());
 
     let preferred = env_shell
         .map(PathBuf::from)
         .filter(|path| path.exists())
-        .or_else(|| {
-            let fallback = PathBuf::from("/bin/zsh");
-            if fallback.exists() {
-                Some(fallback)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+        .or_else(default_shell_program)
+        .unwrap_or_else(fallback_shell_program);
 
-    preferred.to_string_lossy().into_owned()
+    let program = preferred.to_string_lossy().into_owned();
+    let args = if cfg!(windows) {
+        shell_args_for_windows(&program)
+    } else {
+        vec![String::from("-i")]
+    };
+
+    ShellCommand { program, args }
+}
+
+fn default_shell_program() -> Option<PathBuf> {
+    if cfg!(windows) {
+        for candidate in [
+            PathBuf::from("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+            PathBuf::from("C:/Windows/System32/cmd.exe"),
+        ] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    } else {
+        for candidate in [PathBuf::from("/bin/zsh"), PathBuf::from("/bin/bash")] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+fn fallback_shell_program() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from("cmd.exe")
+    } else {
+        PathBuf::from("/bin/sh")
+    }
+}
+
+fn shell_args_for_windows(program: &str) -> Vec<String> {
+    let lower = program.to_ascii_lowercase();
+    if lower.ends_with("powershell.exe") || lower.ends_with("pwsh.exe") {
+        vec![String::from("-NoLogo"), String::from("-NoExit")]
+    } else if lower.ends_with("cmd.exe") {
+        vec![String::from("/K")]
+    } else {
+        Vec::new()
+    }
 }
 
 fn encode_key_event(event: KeyEvent) -> Option<Vec<u8>> {
@@ -326,5 +374,38 @@ fn ctrl_code(ch: char) -> Option<u8> {
         '7' | '/' | '_' => Some(31),
         '8' | '?' => Some(127),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{ctrl_code, encode_key_event};
+
+    #[test]
+    fn encodes_ctrl_character() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(encode_key_event(key), Some(vec![3]));
+    }
+
+    #[test]
+    fn encodes_alt_character_with_escape_prefix() {
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(encode_key_event(key), Some(vec![0x1b, b'x']));
+    }
+
+    #[test]
+    fn encodes_shift_tab_sequence() {
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        assert_eq!(encode_key_event(key), Some(b"\x1b[Z".to_vec()));
+    }
+
+    #[test]
+    fn maps_ctrl_code_variants() {
+        assert_eq!(ctrl_code('a'), Some(1));
+        assert_eq!(ctrl_code('A'), Some(1));
+        assert_eq!(ctrl_code(']'), Some(29));
+        assert_eq!(ctrl_code('~'), None);
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -48,44 +47,12 @@ pub fn repo_root() -> Result<PathBuf> {
 }
 
 pub fn status(repo_root: &Path) -> Result<RepoStatus> {
-    let mut staged = run_z_list(repo_root, &["diff", "--cached", "--name-only", "-z"])?;
-    staged.sort_unstable();
-    staged.dedup();
-
-    let mut unstaged_tracked = run_z_list(repo_root, &["diff", "--name-only", "-z"])?;
-    unstaged_tracked.sort_unstable();
-    unstaged_tracked.dedup();
-
-    let mut untracked = run_z_list(
-        repo_root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?;
-    untracked.sort_unstable();
-    untracked.dedup();
-
-    let tracked_set: HashSet<String> = unstaged_tracked.iter().cloned().collect();
-    let mut unstaged = Vec::with_capacity(unstaged_tracked.len() + untracked.len());
-
-    for path in unstaged_tracked {
-        unstaged.push(FileEntry {
-            path,
-            kind: UnstagedKind::Tracked,
-        });
+    let output = run_git(repo_root, &["status", "--porcelain=v1", "-z"])?;
+    if !output.status.success() {
+        bail!(git_error("list file changes", &output));
     }
 
-    for path in untracked {
-        if tracked_set.contains(path.as_str()) {
-            continue;
-        }
-        unstaged.push(FileEntry {
-            path,
-            kind: UnstagedKind::Untracked,
-        });
-    }
-
-    unstaged.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-
-    Ok(RepoStatus { unstaged, staged })
+    Ok(parse_porcelain_status(&output.stdout))
 }
 
 pub fn diff_for_file(repo_root: &Path, path: &str, mode: DiffMode) -> Result<String> {
@@ -98,7 +65,7 @@ pub fn diff_for_file(repo_root: &Path, path: &str, mode: DiffMode) -> Result<Str
         }
         DiffMode::Untracked => {
             command
-                .args(["diff", "--no-index", "--", "/dev/null"])
+                .args(["diff", "--no-index", "--", null_device_path()])
                 .arg(path);
         }
         DiffMode::Staged => {
@@ -188,15 +155,6 @@ pub fn undo_file_to_mainline(repo_root: &Path, path: &str, was_untracked: bool) 
     ));
 }
 
-fn run_z_list(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let output = run_git(repo_root, args)?;
-    if !output.status.success() {
-        bail!(git_error("list file changes", &output));
-    }
-
-    Ok(parse_nul_terminated(&output.stdout))
-}
-
 fn run_git(repo_root: &Path, args: &[&str]) -> Result<Output> {
     Command::new("git")
         .current_dir(repo_root)
@@ -255,11 +213,106 @@ fn parse_nul_terminated(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn parse_porcelain_status(raw: &[u8]) -> RepoStatus {
+    let records = parse_nul_terminated(raw);
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+
+    let mut idx = 0;
+    while idx < records.len() {
+        let entry = records[idx].as_str();
+        idx += 1;
+
+        if entry.len() < 3 {
+            continue;
+        }
+
+        let bytes = entry.as_bytes();
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+
+        if x == '!' && y == '!' {
+            continue;
+        }
+
+        if bytes.get(2).copied() != Some(b' ') {
+            continue;
+        }
+
+        let mut path = entry[3..].to_owned();
+        let rename_or_copy = matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C');
+        if rename_or_copy && idx < records.len() {
+            path = records[idx].clone();
+            idx += 1;
+        }
+
+        if x == '?' && y == '?' {
+            unstaged.push(FileEntry {
+                path,
+                kind: UnstagedKind::Untracked,
+            });
+            continue;
+        }
+
+        if x != ' ' && x != '?' {
+            staged.push(path.clone());
+        }
+
+        if y != ' ' {
+            unstaged.push(FileEntry {
+                path,
+                kind: UnstagedKind::Tracked,
+            });
+        }
+    }
+
+    staged.sort_unstable();
+    staged.dedup();
+
+    unstaged.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    unstaged.dedup_by(|a, b| a.path == b.path && a.kind == b.kind);
+
+    RepoStatus { unstaged, staged }
+}
+
+fn null_device_path() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
 fn git_error(action: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if stderr.is_empty() {
         format!("git failed to {action} (exit status: {})", output.status)
     } else {
         format!("git failed to {action}: {stderr}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UnstagedKind, parse_porcelain_status};
+
+    #[test]
+    fn parses_staged_unstaged_and_untracked_entries() {
+        let raw = b"M  staged.txt\0 M unstaged.txt\0MM both.txt\0?? new.txt\0";
+        let status = parse_porcelain_status(raw);
+
+        assert_eq!(status.staged, vec!["both.txt", "staged.txt"]);
+        assert_eq!(status.unstaged.len(), 3);
+        assert_eq!(status.unstaged[0].path, "both.txt");
+        assert_eq!(status.unstaged[0].kind, UnstagedKind::Tracked);
+        assert_eq!(status.unstaged[1].path, "new.txt");
+        assert_eq!(status.unstaged[1].kind, UnstagedKind::Untracked);
+        assert_eq!(status.unstaged[2].path, "unstaged.txt");
+        assert_eq!(status.unstaged[2].kind, UnstagedKind::Tracked);
+    }
+
+    #[test]
+    fn uses_destination_path_for_renames() {
+        let raw = b"R  old-name.txt\0new-name.txt\0";
+        let status = parse_porcelain_status(raw);
+
+        assert_eq!(status.staged, vec!["new-name.txt"]);
+        assert!(status.unstaged.is_empty());
     }
 }

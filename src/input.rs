@@ -4,6 +4,36 @@ use crossterm::event::{
 };
 
 use crate::app::App;
+use crate::keymap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainKeyAction {
+    SwitchFocus,
+    MoveUp,
+    MoveDown,
+    TogglePaneFocus,
+    PageUp,
+    PageDown,
+    Stage,
+    Unstage,
+    UndoToMainline,
+    CycleDiffView,
+    ToggleSidebar,
+    SidebarNarrow,
+    SidebarWide,
+    ToggleSettings,
+    OpenTerminal,
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsKeyAction {
+    Close,
+    MoveUp,
+    MoveDown,
+    AdjustLeft,
+    AdjustRight,
+}
 
 pub fn handle_event(app: &mut App, event: Event) -> bool {
     if app.has_pending_undo_confirmation() {
@@ -22,7 +52,7 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
                 return true;
             }
 
-            if key.code == KeyCode::Char('q') {
+            if key.code == KeyCode::Char(keymap::KEY_QUIT) {
                 return false;
             }
 
@@ -31,72 +61,8 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
                 return true;
             }
 
-            match key.code {
-                KeyCode::Tab => {
-                    let result = app.switch_focus();
-                    run_action(app, result);
-                }
-                KeyCode::BackTab => {
-                    let result = app.switch_focus();
-                    run_action(app, result);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if app.is_diff_focused() {
-                        app.scroll_diff(-1);
-                    } else {
-                        let result = app.move_selection(-1);
-                        run_action(app, result);
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if app.is_diff_focused() {
-                        app.scroll_diff(1);
-                    } else {
-                        let result = app.move_selection(1);
-                        run_action(app, result);
-                    }
-                }
-                KeyCode::Left | KeyCode::Right => app.toggle_pane_focus(),
-                KeyCode::PageUp => app.scroll_diff(-10),
-                KeyCode::PageDown => app.scroll_diff(10),
-                KeyCode::Char('s') => {
-                    let result = app.stage_selected();
-                    run_action(app, result);
-                }
-                KeyCode::Char('u') => {
-                    let result = app.unstage_selected();
-                    run_action(app, result);
-                }
-                KeyCode::Char('x') => {
-                    let result = app.undo_selected_to_mainline();
-                    run_action(app, result);
-                }
-                KeyCode::Char('v') => {
-                    let result = app.cycle_diff_view_mode(1);
-                    run_action(app, result);
-                }
-                KeyCode::Char('b') => {
-                    let result = app.toggle_sidebar_visibility();
-                    run_action(app, result);
-                }
-                KeyCode::Char('[') => {
-                    let result = app.resize_sidebar(-1);
-                    run_action(app, result);
-                }
-                KeyCode::Char(']') => {
-                    let result = app.resize_sidebar(1);
-                    run_action(app, result);
-                }
-                KeyCode::Char('o') => app.toggle_settings_panel(),
-                KeyCode::Char(':') | KeyCode::Char('!') => {
-                    let result = app.open_terminal();
-                    run_action(app, result);
-                }
-                KeyCode::Char('r') => {
-                    let result = app.refresh_with_message();
-                    run_action(app, result);
-                }
-                _ => {}
+            if let Some(action) = map_main_key(key.code) {
+                run_main_action(app, action);
             }
         }
         Event::Paste(text) if app.terminal_open => {
@@ -133,6 +99,62 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
     true
 }
 
+fn map_main_key(code: KeyCode) -> Option<MainKeyAction> {
+    match code {
+        KeyCode::Tab | KeyCode::BackTab => Some(MainKeyAction::SwitchFocus),
+        KeyCode::Up | KeyCode::Char('k') => Some(MainKeyAction::MoveUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(MainKeyAction::MoveDown),
+        KeyCode::Left | KeyCode::Right => Some(MainKeyAction::TogglePaneFocus),
+        KeyCode::PageUp => Some(MainKeyAction::PageUp),
+        KeyCode::PageDown => Some(MainKeyAction::PageDown),
+        KeyCode::Char(keymap::KEY_STAGE) => Some(MainKeyAction::Stage),
+        KeyCode::Char(keymap::KEY_UNSTAGE) => Some(MainKeyAction::Unstage),
+        KeyCode::Char(keymap::KEY_UNDO_MAINLINE) => Some(MainKeyAction::UndoToMainline),
+        KeyCode::Char(keymap::KEY_CYCLE_DIFF_VIEW) => Some(MainKeyAction::CycleDiffView),
+        KeyCode::Char(keymap::KEY_TOGGLE_SIDEBAR) => Some(MainKeyAction::ToggleSidebar),
+        KeyCode::Char(keymap::KEY_SIDEBAR_NARROW) => Some(MainKeyAction::SidebarNarrow),
+        KeyCode::Char(keymap::KEY_SIDEBAR_WIDE) => Some(MainKeyAction::SidebarWide),
+        KeyCode::Char(keymap::KEY_OPEN_SETTINGS) => Some(MainKeyAction::ToggleSettings),
+        KeyCode::Char(keymap::KEY_OPEN_TERMINAL_PRIMARY)
+        | KeyCode::Char(keymap::KEY_OPEN_TERMINAL_ALT) => Some(MainKeyAction::OpenTerminal),
+        KeyCode::Char(keymap::KEY_REFRESH) => Some(MainKeyAction::Refresh),
+        _ => None,
+    }
+}
+
+fn run_main_action(app: &mut App, action: MainKeyAction) {
+    match action {
+        MainKeyAction::SwitchFocus => run_action_with(app, App::switch_focus),
+        MainKeyAction::MoveUp => {
+            if app.is_diff_focused() {
+                app.scroll_diff(-1);
+            } else {
+                run_action_with(app, |app| app.move_selection(-1));
+            }
+        }
+        MainKeyAction::MoveDown => {
+            if app.is_diff_focused() {
+                app.scroll_diff(1);
+            } else {
+                run_action_with(app, |app| app.move_selection(1));
+            }
+        }
+        MainKeyAction::TogglePaneFocus => app.toggle_pane_focus(),
+        MainKeyAction::PageUp => app.scroll_diff(-10),
+        MainKeyAction::PageDown => app.scroll_diff(10),
+        MainKeyAction::Stage => run_action_with(app, App::stage_selected),
+        MainKeyAction::Unstage => run_action_with(app, App::unstage_selected),
+        MainKeyAction::UndoToMainline => run_action_with(app, App::undo_selected_to_mainline),
+        MainKeyAction::CycleDiffView => run_action_with(app, |app| app.cycle_diff_view_mode(1)),
+        MainKeyAction::ToggleSidebar => run_action_with(app, App::toggle_sidebar_visibility),
+        MainKeyAction::SidebarNarrow => run_action_with(app, |app| app.resize_sidebar(-1)),
+        MainKeyAction::SidebarWide => run_action_with(app, |app| app.resize_sidebar(1)),
+        MainKeyAction::ToggleSettings => app.toggle_settings_panel(),
+        MainKeyAction::OpenTerminal => run_action_with(app, App::open_terminal),
+        MainKeyAction::Refresh => run_action_with(app, App::refresh_with_message),
+    }
+}
+
 fn handle_pending_undo_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -147,19 +169,31 @@ fn handle_pending_undo_key(app: &mut App, code: KeyCode) {
 }
 
 fn handle_settings_key(app: &mut App, code: KeyCode) {
+    if let Some(action) = map_settings_key(code) {
+        match action {
+            SettingsKeyAction::Close => app.close_settings_panel(),
+            SettingsKeyAction::MoveUp => app.move_settings_selection(-1),
+            SettingsKeyAction::MoveDown => app.move_settings_selection(1),
+            SettingsKeyAction::AdjustLeft => {
+                run_action_with(app, |app| app.adjust_selected_setting(-1))
+            }
+            SettingsKeyAction::AdjustRight => {
+                run_action_with(app, |app| app.adjust_selected_setting(1))
+            }
+        }
+    }
+}
+
+fn map_settings_key(code: KeyCode) -> Option<SettingsKeyAction> {
     match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('o') => app.close_settings_panel(),
-        KeyCode::Up | KeyCode::Char('k') => app.move_settings_selection(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.move_settings_selection(1),
-        KeyCode::Left | KeyCode::Char('h') => {
-            let result = app.adjust_selected_setting(-1);
-            run_action(app, result);
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char(keymap::KEY_SETTINGS_CLOSE) => {
+            Some(SettingsKeyAction::Close)
         }
-        KeyCode::Right | KeyCode::Char('l') => {
-            let result = app.adjust_selected_setting(1);
-            run_action(app, result);
-        }
-        _ => {}
+        KeyCode::Up | KeyCode::Char('k') => Some(SettingsKeyAction::MoveUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(SettingsKeyAction::MoveDown),
+        KeyCode::Left | KeyCode::Char('h') => Some(SettingsKeyAction::AdjustLeft),
+        KeyCode::Right | KeyCode::Char('l') => Some(SettingsKeyAction::AdjustRight),
+        _ => None,
     }
 }
 
@@ -189,7 +223,9 @@ fn handle_terminal_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c') {
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && key.code == KeyCode::Char(keymap::KEY_TERMINAL_COPY_MODE)
+    {
         app.terminal_enter_copy_mode();
         return;
     }
@@ -200,7 +236,9 @@ fn handle_terminal_key(app: &mut App, key: KeyEvent) {
 
 fn handle_terminal_copy_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('i') => app.terminal_exit_copy_mode(),
+        KeyCode::Esc | KeyCode::Char(keymap::KEY_TERMINAL_INTERACTIVE_MODE) => {
+            app.terminal_exit_copy_mode()
+        }
         KeyCode::Up | KeyCode::Char('k') => app.terminal_move_cursor(-1, 0),
         KeyCode::Down | KeyCode::Char('j') => app.terminal_move_cursor(1, 0),
         KeyCode::Left | KeyCode::Char('h') => app.terminal_move_cursor(0, -1),
@@ -209,13 +247,15 @@ fn handle_terminal_copy_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageDown => app.scroll_terminal(-10),
         KeyCode::Home => app.scroll_terminal(10_000),
         KeyCode::End => app.scroll_terminal(-10_000),
-        KeyCode::Char('v') => app.terminal_toggle_selection_anchor(),
-        KeyCode::Char('y') => {
+        KeyCode::Char(keymap::KEY_TERMINAL_SELECTION_ANCHOR) => {
+            app.terminal_toggle_selection_anchor()
+        }
+        KeyCode::Char(keymap::KEY_TERMINAL_YANK) => {
             let result = app.terminal_yank_selection();
             run_action(app, result);
         }
-        KeyCode::Char('/') => app.terminal_open_search(),
-        KeyCode::Char('n') => app.terminal_search_next(),
+        KeyCode::Char(keymap::KEY_TERMINAL_SEARCH) => app.terminal_open_search(),
+        KeyCode::Char(keymap::KEY_TERMINAL_SEARCH_NEXT) => app.terminal_search_next(),
         _ => {}
     }
 }
@@ -250,5 +290,51 @@ fn is_terminal_close_chord(key: KeyEvent) -> bool {
 fn run_action(app: &mut App, result: Result<()>) {
     if let Err(error) = result {
         app.set_error(error);
+    }
+}
+
+fn run_action_with<F>(app: &mut App, action: F)
+where
+    F: FnOnce(&mut App) -> Result<()>,
+{
+    let result = action(app);
+    run_action(app, result);
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+
+    use super::{MainKeyAction, SettingsKeyAction, map_main_key, map_settings_key};
+    use crate::keymap;
+
+    #[test]
+    fn maps_main_keybindings_to_actions() {
+        assert_eq!(
+            map_main_key(KeyCode::Char(keymap::KEY_STAGE)),
+            Some(MainKeyAction::Stage)
+        );
+        assert_eq!(
+            map_main_key(KeyCode::Char(keymap::KEY_UNDO_MAINLINE)),
+            Some(MainKeyAction::UndoToMainline)
+        );
+        assert_eq!(
+            map_main_key(KeyCode::Char(keymap::KEY_OPEN_TERMINAL_PRIMARY)),
+            Some(MainKeyAction::OpenTerminal)
+        );
+        assert_eq!(map_main_key(KeyCode::F(5)), None);
+    }
+
+    #[test]
+    fn maps_settings_keybindings_to_actions() {
+        assert_eq!(
+            map_settings_key(KeyCode::Char(keymap::KEY_SETTINGS_CLOSE)),
+            Some(SettingsKeyAction::Close)
+        );
+        assert_eq!(
+            map_settings_key(KeyCode::Char('h')),
+            Some(SettingsKeyAction::AdjustLeft)
+        );
+        assert_eq!(map_settings_key(KeyCode::Char('x')), None);
     }
 }

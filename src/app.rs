@@ -1,20 +1,28 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
-use crate::diff::{DiffRow, parse_unified_diff};
+use crate::diff::{DiffRow, parse_unified_diff, unified_line_count};
 use crate::git::{self, DiffMode, FileEntry, UnstagedKind};
+use crate::layout;
 use crate::settings::{
     self, AUTO_SPLIT_MIN_WIDTH_MAX, AUTO_SPLIT_MIN_WIDTH_MIN, AppSettings, DiffViewMode,
     SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
 };
 use crate::terminal::{TerminalSession, TerminalStyledRow};
 
+mod status;
+mod util;
+
+pub use status::{StatusKind, StatusMessage};
+use util::{contains, ensure_visible, find_query_in_line, order_positions, shift_and_clamp_u16};
+
 const SETTINGS_FIELD_COUNT: usize = 7;
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const SETTINGS_WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusSection {
@@ -71,6 +79,8 @@ struct PendingUndoConfirmation {
 pub struct App {
     repo_root: PathBuf,
     last_auto_refresh: Instant,
+    settings_dirty: bool,
+    last_settings_change: Option<Instant>,
     pub settings: AppSettings,
     pub settings_open: bool,
     pub settings_selected: usize,
@@ -97,24 +107,26 @@ pub struct App {
     pub diff_rows: Vec<DiffRow>,
     pub diff_scroll: usize,
     pub diff_content_height: usize,
-    pub status_line: String,
+    pub status: StatusMessage,
     pub layout: UiLayout,
     pending_undo_confirmation: Option<PendingUndoConfirmation>,
 }
 
 impl App {
     pub fn new(repo_root: PathBuf) -> Result<Self> {
-        let (settings, status_line) = match settings::load() {
-            Ok(settings) => (settings, String::from("Ready")),
+        let (settings, status) = match settings::load() {
+            Ok(settings) => (settings, StatusMessage::info("Ready")),
             Err(error) => (
                 AppSettings::default(),
-                format!("Settings parse error, using defaults ({error})"),
+                StatusMessage::warn(format!("Settings parse error, using defaults ({error})")),
             ),
         };
 
         let mut app = Self {
             repo_root,
             last_auto_refresh: Instant::now(),
+            settings_dirty: false,
+            last_settings_change: None,
             settings,
             settings_open: false,
             settings_selected: 0,
@@ -141,7 +153,7 @@ impl App {
             diff_rows: Vec::new(),
             diff_scroll: 0,
             diff_content_height: 0,
-            status_line,
+            status,
             layout: UiLayout::default(),
             pending_undo_confirmation: None,
         };
@@ -153,7 +165,7 @@ impl App {
 
     pub fn refresh_with_message(&mut self) -> Result<()> {
         self.refresh()?;
-        self.status_line = String::from("Refreshed");
+        self.set_status_info("Refreshed");
         Ok(())
     }
 
@@ -178,33 +190,57 @@ impl App {
         Ok(())
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
+        let mut changed = false;
         let mut exit_message = None;
+        let mut terminal_error = None;
 
         if let Some(session) = self.terminal_session.as_mut() {
-            session.pump_output();
+            if session.pump_output() {
+                changed = true;
+            }
 
             match session.poll_exit_message() {
                 Ok(message) => exit_message = message,
-                Err(error) => self.status_line = format!("Error: {error}"),
+                Err(error) => terminal_error = Some(error.to_string()),
             }
 
             if self.terminal_scrollback > 0 {
                 session.set_scrollback(self.terminal_scrollback);
                 self.terminal_scrollback = session.scrollback();
+                changed = true;
             }
         }
 
+        if let Some(error) = terminal_error {
+            self.set_status_error(error);
+            changed = true;
+        }
+
         if let Some(message) = exit_message {
-            self.status_line = format!("Terminal session ended: {message}");
+            self.set_status_info(format!("Terminal session ended: {message}"));
+            changed = true;
         }
 
         if !self.terminal_open
             && !self.settings_open
             && let Err(error) = self.auto_refresh_if_due()
         {
-            self.status_line = format!("Error: {error}");
+            self.set_status_error(error);
+            changed = true;
         }
+
+        match self.flush_settings_if_due() {
+            Ok(flushed) => {
+                changed |= flushed;
+            }
+            Err(error) => {
+                self.set_status_error(error);
+                changed = true;
+            }
+        }
+
+        changed
     }
 
     pub fn switch_focus(&mut self) -> Result<()> {
@@ -235,35 +271,35 @@ impl App {
 
     pub fn stage_selected(&mut self) -> Result<()> {
         if self.focus != FocusSection::Unstaged {
-            self.status_line = String::from("Focus Unstaged to stage files");
+            self.set_status_warn("Focus Unstaged to stage files");
             return Ok(());
         }
 
         let Some(entry) = self.selected_unstaged().cloned() else {
-            self.status_line = String::from("No unstaged file selected");
+            self.set_status_warn("No unstaged file selected");
             return Ok(());
         };
 
         git::stage_file(&self.repo_root, &entry.path)?;
         self.refresh()?;
-        self.status_line = format!("Staged {}", entry.path);
+        self.set_status_info(format!("Staged {}", entry.path));
         Ok(())
     }
 
     pub fn unstage_selected(&mut self) -> Result<()> {
         if self.focus != FocusSection::Staged {
-            self.status_line = String::from("Focus Staged to unstage files");
+            self.set_status_warn("Focus Staged to unstage files");
             return Ok(());
         }
 
         let Some(path) = self.selected_staged_path().map(ToOwned::to_owned) else {
-            self.status_line = String::from("No staged file selected");
+            self.set_status_warn("No staged file selected");
             return Ok(());
         };
 
         git::unstage_file(&self.repo_root, &path)?;
         self.refresh()?;
-        self.status_line = format!("Unstaged {path}");
+        self.set_status_info(format!("Unstaged {path}"));
         Ok(())
     }
 
@@ -274,10 +310,10 @@ impl App {
 
         if self.settings.confirm_undo_to_mainline {
             self.pending_undo_confirmation = Some(target.clone());
-            self.status_line = format!(
+            self.set_status_warn(format!(
                 "Undo {} to mainline? Press y to confirm, n/Esc to cancel",
                 target.path
-            );
+            ));
             return Ok(());
         }
 
@@ -298,7 +334,7 @@ impl App {
 
     pub fn cancel_pending_undo_to_mainline(&mut self) {
         if self.pending_undo_confirmation.take().is_some() {
-            self.status_line = String::from("Undo cancelled");
+            self.set_status_info("Undo cancelled");
         }
     }
 
@@ -336,8 +372,11 @@ impl App {
 
     pub fn cycle_diff_view_mode(&mut self, delta: isize) -> Result<()> {
         self.settings.diff_view_mode = self.settings.diff_view_mode.cycle(delta);
-        self.persist_settings()?;
-        self.status_line = format!("Diff view: {}", self.settings.diff_view_mode.label());
+        self.mark_settings_dirty();
+        self.set_status_info(format!(
+            "Diff view: {}",
+            self.settings.diff_view_mode.label()
+        ));
         Ok(())
     }
 
@@ -346,12 +385,12 @@ impl App {
         if !self.settings.sidebar_visible {
             self.pane_focus = PaneFocus::Diff;
         }
-        self.persist_settings()?;
-        self.status_line = if self.settings.sidebar_visible {
+        self.mark_settings_dirty();
+        self.set_status_info(if self.settings.sidebar_visible {
             String::from("Sidebar shown")
         } else {
             String::from("Sidebar hidden")
-        };
+        });
         Ok(())
     }
 
@@ -369,8 +408,8 @@ impl App {
         }
 
         self.settings.sidebar_width = next;
-        self.persist_settings()?;
-        self.status_line = format!("Sidebar width: {}", self.settings.sidebar_width);
+        self.mark_settings_dirty();
+        self.set_status_info(format!("Sidebar width: {}", self.settings.sidebar_width));
         Ok(())
     }
 
@@ -392,7 +431,7 @@ impl App {
             self.terminal_scrollback = session.scrollback();
         }
 
-        self.status_line = String::from("Terminal open (interactive)");
+        self.set_status_info("Terminal open (interactive)");
         Ok(())
     }
 
@@ -409,9 +448,9 @@ impl App {
             self.terminal_view_rows = 0;
             self.terminal_view_cols = 0;
             self.terminal_session = None;
-            self.status_line = String::from("Terminal closed");
+            self.set_status_info("Terminal closed");
             if let Err(error) = self.refresh() {
-                self.status_line = format!("Error: {error}");
+                self.set_status_error(error);
             }
         }
     }
@@ -487,7 +526,7 @@ impl App {
         self.terminal_selection_anchor = None;
         self.terminal_cursor_row = self.terminal_view_rows.saturating_sub(1);
         self.terminal_cursor_col = 0;
-        self.status_line = String::from("Copy mode");
+        self.set_status_info("Copy mode");
     }
 
     pub fn terminal_exit_copy_mode(&mut self) {
@@ -496,7 +535,7 @@ impl App {
             self.terminal_search_open = false;
             self.terminal_search_query.clear();
             self.terminal_selection_anchor = None;
-            self.status_line = String::from("Terminal interactive mode");
+            self.set_status_info("Terminal interactive mode");
         }
     }
 
@@ -537,23 +576,23 @@ impl App {
     pub fn terminal_toggle_selection_anchor(&mut self) {
         if self.terminal_selection_anchor.is_some() {
             self.terminal_selection_anchor = None;
-            self.status_line = String::from("Selection cleared");
+            self.set_status_info("Selection cleared");
         } else {
             self.terminal_selection_anchor =
                 Some((self.terminal_cursor_row, self.terminal_cursor_col));
-            self.status_line = String::from("Selection anchor set");
+            self.set_status_info("Selection anchor set");
         }
     }
 
     pub fn terminal_yank_selection(&mut self) -> Result<()> {
         let Some(anchor) = self.terminal_selection_anchor else {
-            self.status_line = String::from("No selection anchor; press v first");
+            self.set_status_warn("No selection anchor; press v first");
             return Ok(());
         };
 
         let rows = self.terminal_plain_rows();
         if rows.is_empty() {
-            self.status_line = String::from("Nothing to copy");
+            self.set_status_warn("Nothing to copy");
             return Ok(());
         }
 
@@ -586,7 +625,7 @@ impl App {
         }
 
         if out.is_empty() {
-            self.status_line = String::from("Selection is empty");
+            self.set_status_warn("Selection is empty");
             return Ok(());
         }
 
@@ -596,7 +635,7 @@ impl App {
             .set_text(out.clone())
             .context("failed to copy selection to clipboard")?;
 
-        self.status_line = format!("Copied {} chars", out.chars().count());
+        self.set_status_info(format!("Copied {} chars", out.chars().count()));
         self.terminal_selection_anchor = None;
         Ok(())
     }
@@ -609,7 +648,7 @@ impl App {
     pub fn terminal_cancel_search(&mut self) {
         self.terminal_search_open = false;
         self.terminal_search_query.clear();
-        self.status_line = String::from("Search cancelled");
+        self.set_status_info("Search cancelled");
     }
 
     pub fn terminal_search_append(&mut self, ch: char) {
@@ -628,7 +667,7 @@ impl App {
         };
 
         if query.is_empty() {
-            self.status_line = String::from("Search query is empty");
+            self.set_status_warn("Search query is empty");
             self.terminal_search_open = false;
             return;
         }
@@ -638,7 +677,7 @@ impl App {
 
         let rows = self.terminal_plain_rows();
         if rows.is_empty() {
-            self.status_line = String::from("No terminal output to search");
+            self.set_status_warn("No terminal output to search");
             return;
         }
 
@@ -674,9 +713,9 @@ impl App {
         if let Some((row_idx, col_idx)) = found {
             self.terminal_cursor_row = row_idx.min(self.terminal_view_rows.saturating_sub(1));
             self.terminal_cursor_col = col_idx.min(self.terminal_view_cols.saturating_sub(1));
-            self.status_line = format!("Found `{}`", query);
+            self.set_status_info(format!("Found `{}`", query));
         } else {
-            self.status_line = format!("No match for `{}`", query);
+            self.set_status_warn(format!("No match for `{}`", query));
         }
     }
 
@@ -700,16 +739,24 @@ impl App {
         self.terminal_selection_anchor = None;
         self.settings_open = !self.settings_open;
         if self.settings_open {
-            self.status_line = String::from("Settings open");
+            self.set_status_info("Settings open");
         } else {
-            self.status_line = String::from("Settings closed");
+            if let Err(error) = self.flush_settings_if_dirty() {
+                self.set_status_error(error);
+                return;
+            }
+            self.set_status_info("Settings closed");
         }
     }
 
     pub fn close_settings_panel(&mut self) {
         if self.settings_open {
             self.settings_open = false;
-            self.status_line = String::from("Settings closed");
+            if let Err(error) = self.flush_settings_if_dirty() {
+                self.set_status_error(error);
+                return;
+            }
+            self.set_status_info("Settings closed");
         }
     }
 
@@ -731,23 +778,28 @@ impl App {
         match self.settings_selected {
             0 => {
                 self.settings.diff_view_mode = self.settings.diff_view_mode.cycle(delta);
-                self.persist_settings()?;
-                self.status_line = format!("Diff view: {}", self.settings.diff_view_mode.label());
+                self.mark_settings_dirty();
+                self.set_status_info(format!(
+                    "Diff view: {}",
+                    self.settings.diff_view_mode.label()
+                ));
             }
             1 => {
                 self.settings.sidebar_visible = !self.settings.sidebar_visible;
-                self.persist_settings()?;
-                self.status_line = if self.settings.sidebar_visible {
+                self.mark_settings_dirty();
+                self.set_status_info(if self.settings.sidebar_visible {
                     String::from("Sidebar shown")
                 } else {
                     String::from("Sidebar hidden")
-                };
+                });
             }
             2 => {
                 self.settings.sidebar_position = self.settings.sidebar_position.cycle(delta);
-                self.persist_settings()?;
-                self.status_line =
-                    format!("Sidebar side: {}", self.settings.sidebar_position.label());
+                self.mark_settings_dirty();
+                self.set_status_info(format!(
+                    "Sidebar side: {}",
+                    self.settings.sidebar_position.label()
+                ));
             }
             3 => {
                 self.settings.sidebar_width = shift_and_clamp_u16(
@@ -757,8 +809,8 @@ impl App {
                     SIDEBAR_WIDTH_MIN,
                     SIDEBAR_WIDTH_MAX,
                 );
-                self.persist_settings()?;
-                self.status_line = format!("Sidebar width: {}", self.settings.sidebar_width);
+                self.mark_settings_dirty();
+                self.set_status_info(format!("Sidebar width: {}", self.settings.sidebar_width));
             }
             4 => {
                 self.settings.auto_split_min_width = shift_and_clamp_u16(
@@ -768,25 +820,25 @@ impl App {
                     AUTO_SPLIT_MIN_WIDTH_MIN,
                     AUTO_SPLIT_MIN_WIDTH_MAX,
                 );
-                self.persist_settings()?;
-                self.status_line = format!(
+                self.mark_settings_dirty();
+                self.set_status_info(format!(
                     "Auto split min width: {}",
                     self.settings.auto_split_min_width
-                );
+                ));
             }
             5 => {
                 self.settings.theme = self.settings.theme.cycle(delta);
-                self.persist_settings()?;
-                self.status_line = format!("Theme: {}", self.settings.theme.label());
+                self.mark_settings_dirty();
+                self.set_status_info(format!("Theme: {}", self.settings.theme.label()));
             }
             6 => {
                 self.settings.confirm_undo_to_mainline = !self.settings.confirm_undo_to_mainline;
-                self.persist_settings()?;
-                self.status_line = if self.settings.confirm_undo_to_mainline {
+                self.mark_settings_dirty();
+                self.set_status_info(if self.settings.confirm_undo_to_mainline {
                     String::from("Undo confirmation: enabled")
                 } else {
                     String::from("Undo confirmation: disabled")
-                };
+                });
             }
             _ => {}
         }
@@ -863,15 +915,78 @@ impl App {
         self.repo_root.display().to_string()
     }
 
-    pub fn set_layout(&mut self, layout: UiLayout) {
-        self.layout = layout;
+    pub fn status_text(&self) -> &str {
+        self.status.text.as_str()
+    }
+
+    pub fn status_kind(&self) -> StatusKind {
+        self.status.kind
+    }
+
+    pub fn update_layout(&mut self, root: Rect) -> Result<()> {
+        let (main_area, _) = layout::split_root(root);
+        let (sidebar_area, diff_area) = layout::split_main_area(main_area, &self.settings);
+
+        let (unstaged_inner, staged_inner) = if let Some(area) = sidebar_area {
+            let (unstaged_area, staged_area) = layout::split_sidebar(area);
+            (
+                layout::bordered_inner(unstaged_area),
+                layout::bordered_inner(staged_area),
+            )
+        } else {
+            (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0))
+        };
+
+        let (_, diff_body_area) = layout::split_diff(diff_area);
+        let resolved_layout = self.resolved_diff_layout(diff_body_area.width);
+
+        let (diff_viewport_height, diff_content_height) = match resolved_layout {
+            ResolvedDiffLayout::Split => {
+                let (old_pane, new_pane) = layout::split_split_diff(diff_body_area);
+                let old_inner = layout::bordered_inner(old_pane);
+                let new_inner = layout::bordered_inner(new_pane);
+                (
+                    old_inner.height.min(new_inner.height) as usize,
+                    self.diff_rows.len(),
+                )
+            }
+            ResolvedDiffLayout::Unified => (
+                layout::bordered_inner(diff_body_area).height as usize,
+                unified_line_count(&self.diff_rows),
+            ),
+        };
+
+        self.layout = UiLayout {
+            unstaged_inner,
+            staged_inner,
+            diff_area: diff_body_area,
+            diff_viewport_height,
+        };
+        self.diff_content_height = diff_content_height;
+        self.sync_scrolls();
+
         if !self.has_sidebar() {
             self.pane_focus = PaneFocus::Diff;
         }
+
+        if self.terminal_open {
+            let output_area = layout::terminal_output_area(root);
+            self.set_terminal_viewport(output_area.height as usize, output_area.width as usize)?;
+        }
+
+        Ok(())
     }
 
-    pub fn set_diff_content_height(&mut self, content_height: usize) {
-        self.diff_content_height = content_height;
+    fn set_status_info(&mut self, text: impl Into<String>) {
+        self.status = StatusMessage::info(text);
+    }
+
+    fn set_status_warn(&mut self, text: impl Into<String>) {
+        self.status = StatusMessage::warn(text);
+    }
+
+    fn set_status_error(&mut self, error: impl ToString) {
+        self.status = StatusMessage::error(format!("Error: {}", error.to_string()));
     }
 
     pub fn sync_scrolls(&mut self) {
@@ -962,7 +1077,7 @@ impl App {
     }
 
     pub fn set_error(&mut self, error: impl ToString) {
-        self.status_line = format!("Error: {}", error.to_string());
+        self.set_status_error(error.to_string());
     }
 
     pub fn active_path(&self) -> Option<&str> {
@@ -986,7 +1101,7 @@ impl App {
         match self.focus {
             FocusSection::Unstaged => {
                 let Some(entry) = self.selected_unstaged().cloned() else {
-                    self.status_line = String::from("No unstaged file selected");
+                    self.set_status_warn("No unstaged file selected");
                     return None;
                 };
 
@@ -997,7 +1112,7 @@ impl App {
             }
             FocusSection::Staged => {
                 let Some(path) = self.selected_staged_path().map(ToOwned::to_owned) else {
-                    self.status_line = String::from("No staged file selected");
+                    self.set_status_warn("No staged file selected");
                     return None;
                 };
 
@@ -1013,13 +1128,47 @@ impl App {
         let mainline =
             git::undo_file_to_mainline(&self.repo_root, &target.path, target.was_untracked)?;
         self.refresh()?;
-        self.status_line = format!("Reverted {} to {mainline}", target.path);
+        self.set_status_info(format!("Reverted {} to {mainline}", target.path));
         Ok(())
     }
 
-    fn persist_settings(&mut self) -> Result<()> {
+    pub fn flush_pending_settings(&mut self) -> Result<()> {
+        self.flush_settings_if_dirty()
+    }
+
+    fn mark_settings_dirty(&mut self) {
         self.settings.normalize();
+        self.settings_dirty = true;
+        self.last_settings_change = Some(Instant::now());
+    }
+
+    fn flush_settings_if_due(&mut self) -> Result<bool> {
+        if !self.settings_dirty {
+            return Ok(false);
+        }
+
+        let Some(changed_at) = self.last_settings_change else {
+            return Ok(false);
+        };
+
+        if changed_at.elapsed() < SETTINGS_WRITE_DEBOUNCE {
+            return Ok(false);
+        }
+
         settings::save(&self.settings)?;
+        self.settings_dirty = false;
+        self.last_settings_change = None;
+        Ok(true)
+    }
+
+    fn flush_settings_if_dirty(&mut self) -> Result<()> {
+        if !self.settings_dirty {
+            return Ok(());
+        }
+
+        settings::save(&self.settings)?;
+        self.settings_dirty = false;
+        self.last_settings_change = None;
         Ok(())
     }
 
@@ -1035,10 +1184,9 @@ impl App {
             self.terminal_scrollback = 0;
         }
 
-        Ok(self
-            .terminal_session
+        self.terminal_session
             .as_mut()
-            .expect("terminal session should exist after ensure"))
+            .ok_or_else(|| anyhow!("terminal session should exist after initialization"))
     }
 
     fn auto_refresh_if_due(&mut self) -> Result<()> {
@@ -1168,69 +1316,4 @@ impl App {
             FocusSection::Staged => self.staged_selected = value,
         }
     }
-}
-
-fn contains(rect: Rect, x: u16, y: u16) -> bool {
-    x >= rect.x
-        && x < rect.x.saturating_add(rect.width)
-        && y >= rect.y
-        && y < rect.y.saturating_add(rect.height)
-}
-
-fn ensure_visible(selected: Option<usize>, len: usize, visible: usize, scroll: &mut usize) {
-    if len == 0 || visible == 0 {
-        *scroll = 0;
-        return;
-    }
-
-    *scroll = (*scroll).min(len.saturating_sub(visible));
-
-    let Some(selected) = selected else {
-        return;
-    };
-
-    if selected < *scroll {
-        *scroll = selected;
-        return;
-    }
-
-    let bottom = *scroll + visible;
-    if selected >= bottom {
-        *scroll = selected + 1 - visible;
-    }
-}
-
-fn shift_and_clamp_u16(value: u16, delta: isize, step: u16, min: u16, max: u16) -> u16 {
-    let candidate = value as i32 + (delta as i32 * step as i32);
-    candidate.clamp(min as i32, max as i32) as u16
-}
-
-fn order_positions(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
-    if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) {
-        (a, b)
-    } else {
-        (b, a)
-    }
-}
-
-fn find_query_in_line(line: &str, query: &str, start_col: usize) -> Option<usize> {
-    if query.is_empty() {
-        return None;
-    }
-
-    let line_chars = line.chars().collect::<Vec<_>>();
-    let query_chars = query.chars().collect::<Vec<_>>();
-
-    if query_chars.len() > line_chars.len() {
-        return None;
-    }
-
-    let from = start_col.min(line_chars.len());
-    for idx in from..=line_chars.len().saturating_sub(query_chars.len()) {
-        if line_chars[idx..idx + query_chars.len()] == query_chars[..] {
-            return Some(idx);
-        }
-    }
-
-    None
 }

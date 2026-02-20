@@ -159,16 +159,21 @@ pub fn save(settings: &AppSettings) -> Result<PathBuf> {
 }
 
 pub fn config_file_path() -> Option<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("dif").join("config.toml"));
+    config_file_path_from_env(
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn config_file_path_from_env(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        return Some(xdg.join("dif").join("config.toml"));
     }
 
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("dif")
-            .join("config.toml")
-    })
+    home.map(|home| home.join(".config").join("dif").join("config.toml"))
 }
 
 fn cycle<T: Copy + Eq, const N: usize>(items: [T; N], current: T, delta: isize) -> T {
@@ -187,4 +192,63 @@ fn cycle_slice<T: Copy + Eq>(items: &[T], current: T, delta: isize) -> T {
     };
 
     items[(idx + shift) % len]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{
+        AUTO_SPLIT_MIN_WIDTH_MAX, AUTO_SPLIT_MIN_WIDTH_MIN, AppSettings, SIDEBAR_WIDTH_MAX,
+        SIDEBAR_WIDTH_MIN, config_file_path_from_env,
+    };
+
+    #[test]
+    fn normalize_clamps_width_values() {
+        let mut settings = AppSettings {
+            sidebar_width: SIDEBAR_WIDTH_MAX + 30,
+            auto_split_min_width: AUTO_SPLIT_MIN_WIDTH_MIN.saturating_sub(20),
+            ..AppSettings::default()
+        };
+
+        settings.normalize();
+
+        assert_eq!(settings.sidebar_width, SIDEBAR_WIDTH_MAX);
+        assert_eq!(settings.auto_split_min_width, AUTO_SPLIT_MIN_WIDTH_MIN);
+
+        settings.sidebar_width = SIDEBAR_WIDTH_MIN.saturating_sub(5);
+        settings.auto_split_min_width = AUTO_SPLIT_MIN_WIDTH_MAX + 30;
+        settings.normalize();
+
+        assert_eq!(settings.sidebar_width, SIDEBAR_WIDTH_MIN);
+        assert_eq!(settings.auto_split_min_width, AUTO_SPLIT_MIN_WIDTH_MAX);
+    }
+
+    #[test]
+    fn config_path_prefers_xdg_over_home() {
+        let result = config_file_path_from_env(
+            Some(PathBuf::from("/tmp/xdg")),
+            Some(PathBuf::from("/tmp/home")),
+        );
+
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/tmp/xdg").join("dif").join("config.toml"))
+        );
+    }
+
+    #[test]
+    fn config_path_falls_back_to_home() {
+        let result = config_file_path_from_env(None, Some(PathBuf::from("/tmp/home")));
+
+        assert_eq!(
+            result,
+            Some(
+                PathBuf::from("/tmp/home")
+                    .join(".config")
+                    .join("dif")
+                    .join("config.toml")
+            )
+        );
+    }
 }

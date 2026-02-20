@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use anyhow::{Context, Result};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
@@ -18,15 +19,20 @@ pub struct Highlighter {
     monokai_theme: Theme,
 }
 
+pub struct LineHighlighter<'a> {
+    syntax_set: &'a SyntaxSet,
+    highlighter: HighlightLines<'a>,
+}
+
 impl Highlighter {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let themes = ThemeSet::load_defaults().themes;
         let fallback = themes
             .values()
             .next()
             .cloned()
-            .expect("syntect default themes should not be empty");
+            .context("syntect default themes should not be empty")?;
 
         let ocean_theme = pick_theme(
             &themes,
@@ -49,45 +55,20 @@ impl Highlighter {
             &fallback,
         );
 
-        Self {
+        Ok(Self {
             syntax_set,
             ocean_theme,
             eighties_theme,
             solarized_theme,
             monokai_theme,
-        }
+        })
     }
 
-    pub fn highlight_line(
-        &self,
-        path: Option<&str>,
-        line: &str,
-        background_rgb: (u8, u8, u8),
-        app_theme: AppTheme,
-    ) -> Vec<Span<'static>> {
-        if line.is_empty() {
-            return vec![Span::raw(String::new())];
-        }
-
+    pub fn begin<'a>(&'a self, path: Option<&str>, app_theme: AppTheme) -> LineHighlighter<'a> {
         let syntax = self.syntax_for_path(path);
-        let mut highlighter = HighlightLines::new(syntax, self.theme_for(app_theme));
-
-        match highlighter.highlight_line(line, &self.syntax_set) {
-            Ok(ranges) => ranges
-                .into_iter()
-                .map(|(style, segment)| {
-                    let fg_rgb = color_from_syntect(style);
-                    let adjusted = ensure_contrast(fg_rgb, background_rgb);
-                    Span::styled(
-                        segment.to_owned(),
-                        Style::default().fg(Color::Rgb(adjusted.0, adjusted.1, adjusted.2)),
-                    )
-                })
-                .collect(),
-            Err(_) => vec![Span::styled(
-                line.to_owned(),
-                Style::default().fg(Color::Rgb(224, 228, 236)),
-            )],
+        LineHighlighter {
+            syntax_set: &self.syntax_set,
+            highlighter: HighlightLines::new(syntax, self.theme_for(app_theme)),
         }
     }
 
@@ -115,6 +96,32 @@ impl Highlighter {
         }
 
         plain
+    }
+}
+
+impl LineHighlighter<'_> {
+    pub fn highlight(&mut self, line: &str, background_rgb: (u8, u8, u8)) -> Vec<Span<'static>> {
+        if line.is_empty() {
+            return vec![Span::raw(String::new())];
+        }
+
+        match self.highlighter.highlight_line(line, self.syntax_set) {
+            Ok(ranges) => ranges
+                .into_iter()
+                .map(|(style, segment)| {
+                    let fg_rgb = color_from_syntect(style);
+                    let adjusted = ensure_contrast(fg_rgb, background_rgb);
+                    Span::styled(
+                        segment.to_owned(),
+                        Style::default().fg(Color::Rgb(adjusted.0, adjusted.1, adjusted.2)),
+                    )
+                })
+                .collect(),
+            Err(_) => vec![Span::styled(
+                line.to_owned(),
+                Style::default().fg(Color::Rgb(224, 228, 236)),
+            )],
+        }
     }
 }
 
