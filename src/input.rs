@@ -6,6 +6,15 @@ use crossterm::event::{
 use crate::app::App;
 
 pub fn handle_event(app: &mut App, event: Event) -> bool {
+    if app.has_pending_undo_confirmation() {
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            handle_pending_undo_key(app, key.code);
+        }
+        return true;
+    }
+
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if app.terminal_open {
@@ -56,6 +65,10 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
                 }
                 KeyCode::Char('u') => {
                     let result = app.unstage_selected();
+                    run_action(app, result);
+                }
+                KeyCode::Char('x') => {
+                    let result = app.undo_selected_to_mainline();
                     run_action(app, result);
                 }
                 KeyCode::Char('v') => {
@@ -118,6 +131,19 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
     }
 
     true
+}
+
+fn handle_pending_undo_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let result = app.confirm_pending_undo_to_mainline();
+            run_action(app, result);
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.cancel_pending_undo_to_mainline()
+        }
+        _ => {}
+    }
 }
 
 fn handle_settings_key(app: &mut App, code: KeyCode) {

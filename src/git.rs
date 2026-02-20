@@ -148,6 +148,46 @@ pub fn unstage_file(repo_root: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn undo_file_to_mainline(repo_root: &Path, path: &str, was_untracked: bool) -> Result<String> {
+    let mainline = resolve_mainline_ref(repo_root)?;
+
+    let restore_output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["restore", "--source"])
+        .arg(mainline.as_str())
+        .args(["--staged", "--worktree", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("failed to restore `{path}` from `{mainline}`"))?;
+
+    if restore_output.status.success() {
+        return Ok(mainline);
+    }
+
+    if was_untracked {
+        let clean_output = Command::new("git")
+            .current_dir(repo_root)
+            .args(["clean", "-f", "--"])
+            .arg(path)
+            .output()
+            .with_context(|| format!("failed to remove untracked `{path}`"))?;
+
+        if clean_output.status.success() {
+            return Ok(mainline);
+        }
+
+        bail!(git_error(
+            &format!("remove untracked `{path}`"),
+            &clean_output
+        ));
+    }
+
+    bail!(git_error(
+        &format!("restore `{path}` from `{mainline}`"),
+        &restore_output
+    ));
+}
+
 fn run_z_list(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let output = run_git(repo_root, args)?;
     if !output.status.success() {
@@ -163,6 +203,49 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Result<Output> {
         .args(args)
         .output()
         .with_context(|| format!("failed to run `git {}`", args.join(" ")))
+}
+
+fn resolve_mainline_ref(repo_root: &Path) -> Result<String> {
+    let origin_head = run_git(
+        repo_root,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )?;
+
+    if origin_head.status.success() {
+        let branch = String::from_utf8_lossy(&origin_head.stdout)
+            .trim()
+            .to_owned();
+        if !branch.is_empty() && ref_exists(repo_root, branch.as_str())? {
+            return Ok(branch);
+        }
+    }
+
+    for candidate in ["origin/main", "main", "origin/master", "master", "HEAD"] {
+        if ref_exists(repo_root, candidate)? {
+            return Ok(candidate.to_owned());
+        }
+    }
+
+    Ok(String::from("HEAD"))
+}
+
+fn ref_exists(repo_root: &Path, reference: &str) -> Result<bool> {
+    let output = run_git(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ],
+    )?;
+
+    Ok(output.status.success())
 }
 
 fn parse_nul_terminated(raw: &[u8]) -> Vec<String> {

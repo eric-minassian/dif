@@ -13,7 +13,7 @@ use crate::settings::{
 };
 use crate::terminal::{TerminalSession, TerminalStyledRow};
 
-const SETTINGS_FIELD_COUNT: usize = 6;
+const SETTINGS_FIELD_COUNT: usize = 7;
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,12 @@ impl Default for UiLayout {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingUndoConfirmation {
+    path: String,
+    was_untracked: bool,
+}
+
 pub struct App {
     repo_root: PathBuf,
     last_auto_refresh: Instant,
@@ -93,6 +99,7 @@ pub struct App {
     pub diff_content_height: usize,
     pub status_line: String,
     pub layout: UiLayout,
+    pending_undo_confirmation: Option<PendingUndoConfirmation>,
 }
 
 impl App {
@@ -136,6 +143,7 @@ impl App {
             diff_content_height: 0,
             status_line,
             layout: UiLayout::default(),
+            pending_undo_confirmation: None,
         };
 
         app.refresh()?;
@@ -257,6 +265,41 @@ impl App {
         self.refresh()?;
         self.status_line = format!("Unstaged {path}");
         Ok(())
+    }
+
+    pub fn undo_selected_to_mainline(&mut self) -> Result<()> {
+        let Some(target) = self.selected_undo_target() else {
+            return Ok(());
+        };
+
+        if self.settings.confirm_undo_to_mainline {
+            self.pending_undo_confirmation = Some(target.clone());
+            self.status_line = format!(
+                "Undo {} to mainline? Press y to confirm, n/Esc to cancel",
+                target.path
+            );
+            return Ok(());
+        }
+
+        self.apply_undo_to_mainline(target)
+    }
+
+    pub fn has_pending_undo_confirmation(&self) -> bool {
+        self.pending_undo_confirmation.is_some()
+    }
+
+    pub fn confirm_pending_undo_to_mainline(&mut self) -> Result<()> {
+        let Some(target) = self.pending_undo_confirmation.take() else {
+            return Ok(());
+        };
+
+        self.apply_undo_to_mainline(target)
+    }
+
+    pub fn cancel_pending_undo_to_mainline(&mut self) {
+        if self.pending_undo_confirmation.take().is_some() {
+            self.status_line = String::from("Undo cancelled");
+        }
     }
 
     pub fn load_current_diff(&mut self) -> Result<()> {
@@ -736,6 +779,15 @@ impl App {
                 self.persist_settings()?;
                 self.status_line = format!("Theme: {}", self.settings.theme.label());
             }
+            6 => {
+                self.settings.confirm_undo_to_mainline = !self.settings.confirm_undo_to_mainline;
+                self.persist_settings()?;
+                self.status_line = if self.settings.confirm_undo_to_mainline {
+                    String::from("Undo confirmation: enabled")
+                } else {
+                    String::from("Undo confirmation: disabled")
+                };
+            }
             _ => {}
         }
 
@@ -766,6 +818,14 @@ impl App {
                 format!("{}", self.settings.auto_split_min_width),
             ),
             ("Theme", self.settings.theme.label().to_owned()),
+            (
+                "Confirm Undo",
+                if self.settings.confirm_undo_to_mainline {
+                    String::from("Yes")
+                } else {
+                    String::from("No")
+                },
+            ),
         ]
     }
 
@@ -920,6 +980,41 @@ impl App {
             },
             FocusSection::Staged => "Staged",
         }
+    }
+
+    fn selected_undo_target(&mut self) -> Option<PendingUndoConfirmation> {
+        match self.focus {
+            FocusSection::Unstaged => {
+                let Some(entry) = self.selected_unstaged().cloned() else {
+                    self.status_line = String::from("No unstaged file selected");
+                    return None;
+                };
+
+                Some(PendingUndoConfirmation {
+                    path: entry.path,
+                    was_untracked: entry.kind == UnstagedKind::Untracked,
+                })
+            }
+            FocusSection::Staged => {
+                let Some(path) = self.selected_staged_path().map(ToOwned::to_owned) else {
+                    self.status_line = String::from("No staged file selected");
+                    return None;
+                };
+
+                Some(PendingUndoConfirmation {
+                    path,
+                    was_untracked: false,
+                })
+            }
+        }
+    }
+
+    fn apply_undo_to_mainline(&mut self, target: PendingUndoConfirmation) -> Result<()> {
+        let mainline =
+            git::undo_file_to_mainline(&self.repo_root, &target.path, target.was_untracked)?;
+        self.refresh()?;
+        self.status_line = format!("Reverted {} to {mainline}", target.path);
+        Ok(())
     }
 
     fn persist_settings(&mut self) -> Result<()> {

@@ -458,7 +458,9 @@ fn render_unified_diff_pane(
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
-    let hint = if app.terminal_open && app.terminal_search_open {
+    let hint = if app.has_pending_undo_confirmation() {
+        "confirm undo: y apply to mainline, n/Esc cancel"
+    } else if app.terminal_open && app.terminal_search_open {
         "terminal search: type query, Enter find, Esc cancel"
     } else if app.terminal_open && app.terminal_copy_mode {
         "copy mode: move(hjkl/arrows)  v mark  y copy  / search  n next  i interactive"
@@ -467,7 +469,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
     } else if app.settings_open {
         "settings: j/k select, h/l change, Esc close"
     } else {
-        "Tab list  Left/Right pane  Up/Down move-or-scroll  s stage  u unstage  : terminal  o settings  q quit"
+        "Tab list  Left/Right pane  Up/Down move-or-scroll  s stage  u unstage  x undo->mainline  : terminal  o settings  q quit"
     };
 
     let text = format!("{} | {hint}", app.status_line);

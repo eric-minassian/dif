@@ -88,6 +88,7 @@ pub struct AppSettings {
     pub sidebar_width: u16,
     pub auto_split_min_width: u16,
     pub theme: AppTheme,
+    pub confirm_undo_to_mainline: bool,
 }
 
 impl Default for AppSettings {
@@ -99,6 +100,7 @@ impl Default for AppSettings {
             sidebar_width: 34,
             auto_split_min_width: 140,
             theme: AppTheme::Ocean,
+            confirm_undo_to_mainline: true,
         }
     }
 }
