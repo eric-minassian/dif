@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent;
@@ -13,6 +14,7 @@ use crate::settings::{
 use crate::terminal::{TerminalSession, TerminalStyledRow};
 
 const SETTINGS_FIELD_COUNT: usize = 6;
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusSection {
@@ -62,6 +64,7 @@ impl Default for UiLayout {
 
 pub struct App {
     repo_root: PathBuf,
+    last_auto_refresh: Instant,
     pub settings: AppSettings,
     pub settings_open: bool,
     pub settings_selected: usize,
@@ -104,6 +107,7 @@ impl App {
 
         let mut app = Self {
             repo_root,
+            last_auto_refresh: Instant::now(),
             settings,
             settings_open: false,
             settings_selected: 0,
@@ -135,6 +139,7 @@ impl App {
         };
 
         app.refresh()?;
+        app.last_auto_refresh = Instant::now();
         Ok(app)
     }
 
@@ -147,6 +152,8 @@ impl App {
     pub fn refresh(&mut self) -> Result<()> {
         let previous_unstaged = self.selected_unstaged_path().map(ToOwned::to_owned);
         let previous_staged = self.selected_staged_path().map(ToOwned::to_owned);
+        let previous_active = self.active_selection();
+        let previous_diff_scroll = self.diff_scroll;
 
         let status = git::status(&self.repo_root)?;
         self.unstaged = status.unstaged;
@@ -155,7 +162,10 @@ impl App {
         self.restore_unstaged_selection(previous_unstaged);
         self.restore_staged_selection(previous_staged);
         self.normalize_focus();
-        self.load_current_diff()?;
+
+        let preserve_diff_scroll = self.active_selection() == previous_active;
+        self.load_current_diff_with_scroll(preserve_diff_scroll, previous_diff_scroll)?;
+        self.last_auto_refresh = Instant::now();
 
         Ok(())
     }
@@ -179,6 +189,13 @@ impl App {
 
         if let Some(message) = exit_message {
             self.status_line = format!("Terminal session ended: {message}");
+        }
+
+        if !self.terminal_open
+            && !self.settings_open
+            && let Err(error) = self.auto_refresh_if_due()
+        {
+            self.status_line = format!("Error: {error}");
         }
     }
 
@@ -243,17 +260,34 @@ impl App {
     }
 
     pub fn load_current_diff(&mut self) -> Result<()> {
-        self.diff_scroll = 0;
+        self.load_current_diff_with_scroll(false, 0)
+    }
+
+    fn load_current_diff_with_scroll(
+        &mut self,
+        preserve_scroll: bool,
+        preserved_scroll: usize,
+    ) -> Result<()> {
+        if !preserve_scroll {
+            self.diff_scroll = 0;
+        }
 
         let Some((path, mode)) = self.active_selection() else {
             self.diff_rows.clear();
             self.diff_content_height = 0;
+            self.diff_scroll = 0;
             return Ok(());
         };
 
         let raw_diff = git::diff_for_file(&self.repo_root, &path, mode)?;
         self.diff_rows = parse_unified_diff(&raw_diff);
         self.diff_content_height = self.diff_rows.len();
+
+        if preserve_scroll {
+            self.diff_scroll = preserved_scroll;
+            self.sync_scrolls();
+        }
+
         Ok(())
     }
 
@@ -910,6 +944,15 @@ impl App {
             .terminal_session
             .as_mut()
             .expect("terminal session should exist after ensure"))
+    }
+
+    fn auto_refresh_if_due(&mut self) -> Result<()> {
+        if self.last_auto_refresh.elapsed() < AUTO_REFRESH_INTERVAL {
+            return Ok(());
+        }
+
+        self.last_auto_refresh = Instant::now();
+        self.refresh()
     }
 
     fn has_sidebar(&self) -> bool {
