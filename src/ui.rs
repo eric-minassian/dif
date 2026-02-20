@@ -465,7 +465,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
     } else if app.terminal_open && app.terminal_copy_mode {
         "copy mode: move(hjkl/arrows)  v mark  y copy  / search  n next  i interactive"
     } else if app.terminal_open {
-        "terminal: all keys -> shell, Alt+c copy mode, Ctrl+]/Ctrl+g/Ctrl+q close"
+        "terminal: all keys -> shell, Esc close, Alt+c copy mode, Ctrl+]/Ctrl+g/Ctrl+q close"
     } else if app.settings_open {
         "settings: j/k select, h/l change, Esc close"
     } else {
@@ -559,7 +559,7 @@ fn render_terminal_modal(frame: &mut Frame, app: &mut App, area: Rect, palette: 
             .style(Style::default().fg(rgb(palette.dim)))
     } else {
         Paragraph::new(
-            "interactive shell (zsh aliases supported). Alt+c enters copy mode. Ctrl+], Ctrl+g, or Ctrl+q closes.",
+            "interactive shell (zsh aliases supported). Esc closes. Alt+c enters copy mode. Ctrl+], Ctrl+g, or Ctrl+q also close.",
         )
         .style(Style::default().fg(rgb(palette.dim)))
     };

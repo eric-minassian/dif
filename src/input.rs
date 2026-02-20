@@ -164,18 +164,28 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
 }
 
 fn handle_terminal_key(app: &mut App, key: KeyEvent) {
-    if is_terminal_close_chord(key) {
-        app.close_terminal();
-        return;
-    }
-
     if app.terminal_search_open {
+        if is_terminal_close_chord(key) {
+            app.close_terminal();
+            return;
+        }
+
         handle_terminal_search_key(app, key);
         return;
     }
 
     if app.terminal_copy_mode {
+        if is_terminal_close_chord(key) {
+            app.close_terminal();
+            return;
+        }
+
         handle_terminal_copy_key(app, key);
+        return;
+    }
+
+    if key.code == KeyCode::Esc || is_terminal_close_chord(key) {
+        app.close_terminal();
         return;
     }
 
