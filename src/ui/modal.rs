@@ -1,14 +1,14 @@
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use vt100::Color as VtColor;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::app::{App, GitPanelMode};
 use crate::keymap;
 use crate::layout;
-use crate::terminal::{TerminalCellStyle, TerminalStyledRow};
 
 use super::palette::{Palette, rgb};
 
@@ -17,7 +17,6 @@ pub(crate) fn render_terminal_modal(frame: &mut Frame, app: &App, area: Rect, pa
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
-        .title(" Terminal ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(rgb(palette.modal_border)))
         .style(
@@ -28,81 +27,43 @@ pub(crate) fn render_terminal_modal(frame: &mut Frame, app: &App, area: Rect, pa
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
+    let terminal_screen = app.terminal_screen();
     let copy_cursor = app.terminal_cursor();
-    let shell_cursor = app.terminal_shell_cursor();
-    let cursor_text = if app.terminal_copy_mode {
-        format!("{}:{}", copy_cursor.0 + 1, copy_cursor.1 + 1)
-    } else if let Some((row, col)) = shell_cursor {
-        format!("{}:{}", row + 1, col + 1)
+
+    if let Some(screen) = terminal_screen {
+        let terminal_widget = if app.terminal_copy_mode {
+            PseudoTerminal::new(screen).cursor(Cursor::default().visibility(false))
+        } else {
+            PseudoTerminal::new(screen)
+        };
+
+        frame.render_widget(terminal_widget, inner);
+        frame.render_widget(
+            TerminalPaletteDefaults {
+                default_fg: rgb(palette.text),
+                default_bg: rgb(palette.modal_bg),
+            },
+            inner,
+        );
+
+        if app.terminal_copy_mode {
+            let overlay = CopyModeOverlay {
+                selection_rows: app.terminal_selection_rows(),
+                cursor: copy_cursor,
+                selection_bg: rgb(palette.selected_bg_unfocused),
+                cursor_row_bg: rgb(palette.selected_bg_focused),
+                cursor_style: terminal_cursor_style(palette),
+            };
+            frame.render_widget(overlay, inner);
+        }
     } else {
-        String::from("hidden")
-    };
-
-    let mode = if app.terminal_copy_mode {
-        "COPY"
-    } else {
-        "SHELL"
-    };
-    let selection = app
-        .terminal_selection_rows()
-        .map(|(start, end)| format!("  |  sel rows: {}-{}", start + 1, end + 1))
-        .unwrap_or_default();
-
-    let header = Paragraph::new(format!(
-        "repo: {}  |  mode: {}  |  scrollback: {}  |  cursor: {}{}",
-        app.repo_root_display(),
-        mode,
-        app.terminal_scrollback,
-        cursor_text,
-        selection
-    ))
-    .style(Style::default().fg(rgb(palette.dim)));
-    frame.render_widget(header, sections[0]);
-
-    let terminal_rows = app.terminal_rows();
-    let render_cursor = if app.terminal_copy_mode {
-        Some(copy_cursor)
-    } else {
-        shell_cursor
-    };
-
-    let output_lines: Vec<Line<'static>> = if terminal_rows.is_empty() {
-        vec![Line::styled(
+        let output = Paragraph::new(Line::styled(
             "(waiting for terminal output)",
             Style::default().fg(rgb(palette.dim)),
-        )]
-    } else {
-        terminal_rows
-            .into_iter()
-            .enumerate()
-            .map(|(row_idx, row)| terminal_row_to_line(row, row_idx, app, palette, render_cursor))
-            .collect()
-    };
-
-    let output =
-        Paragraph::new(Text::from(output_lines)).style(Style::default().bg(rgb(palette.modal_bg)));
-    frame.render_widget(output, sections[1]);
-
-    let help = if app.terminal_search_open {
-        Paragraph::new(format!("/{}_", app.terminal_search_query))
-            .style(Style::default().fg(rgb(palette.text)))
-    } else if app.terminal_copy_mode {
-        Paragraph::new(keymap::terminal_modal_copy_hint())
-            .style(Style::default().fg(rgb(palette.dim)))
-    } else {
-        Paragraph::new(keymap::terminal_modal_interactive_hint())
-            .style(Style::default().fg(rgb(palette.dim)))
-    };
-    frame.render_widget(help, sections[2]);
+        ))
+        .style(Style::default().bg(rgb(palette.modal_bg)));
+        frame.render_widget(output, inner);
+    }
 }
 
 pub(crate) fn render_settings_modal(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
@@ -455,7 +416,7 @@ fn line_with_editor_cursor(
         return Line::styled(line.to_owned(), base_style);
     };
 
-    let cursor_style = editor_cursor_style(palette);
+    let cursor_style = terminal_cursor_style(palette);
     let chars = line.chars().collect::<Vec<_>>();
 
     if cursor_col >= chars.len() {
@@ -483,123 +444,74 @@ fn line_with_editor_cursor(
     Line::from(spans)
 }
 
-fn editor_cursor_style(palette: &Palette) -> Style {
-    Style::default()
-        .fg(rgb(palette.modal_bg))
-        .bg(rgb(palette.border_focus))
-        .add_modifier(Modifier::BOLD)
+struct CopyModeOverlay {
+    selection_rows: Option<(usize, usize)>,
+    cursor: (usize, usize),
+    selection_bg: ratatui::style::Color,
+    cursor_row_bg: ratatui::style::Color,
+    cursor_style: Style,
 }
 
-fn terminal_row_to_line(
-    row: TerminalStyledRow,
-    row_idx: usize,
-    app: &App,
-    palette: &Palette,
-    terminal_cursor: Option<(usize, usize)>,
-) -> Line<'static> {
-    let interactive_cursor_col = if app.terminal_copy_mode {
-        None
-    } else {
-        terminal_cursor.and_then(|(cursor_row, cursor_col)| {
-            if row_idx == cursor_row {
-                Some(cursor_col)
-            } else {
-                None
-            }
-        })
-    };
-
-    if row.is_empty() {
-        let mut empty = Line::from(Span::raw(String::new()));
-        if app.terminal_copy_mode {
-            let (cursor_row, _) = app.terminal_cursor();
-            if row_idx == cursor_row {
-                empty = empty.style(Style::default().bg(rgb(palette.selected_bg_focused)));
-            }
-        } else if interactive_cursor_col.is_some() {
-            empty = Line::from(Span::styled(" ", terminal_cursor_style(palette)));
-        }
-        return empty;
-    }
-
-    let spans = if let Some(cursor_col) = interactive_cursor_col {
-        build_row_spans_with_cursor(row, cursor_col, palette)
-    } else {
-        row.into_iter()
-            .map(|span| {
-                let style = style_from_terminal_cell(span.style, palette);
-                Span::styled(span.text, style)
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let mut line = Line::from(spans);
-    if app.terminal_copy_mode {
-        if let Some((start, end)) = app.terminal_selection_rows()
-            && row_idx >= start
-            && row_idx <= end
-        {
-            line = line.style(Style::default().bg(rgb(palette.selected_bg_unfocused)));
-        }
-
-        let (cursor_row, _) = app.terminal_cursor();
-        if row_idx == cursor_row {
-            line = line.style(Style::default().bg(rgb(palette.selected_bg_focused)));
-        }
-    }
-
-    line
+struct TerminalPaletteDefaults {
+    default_fg: Color,
+    default_bg: Color,
 }
 
-fn build_row_spans_with_cursor(
-    row: TerminalStyledRow,
-    cursor_col: usize,
-    palette: &Palette,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut cursor_drawn = false;
-    let mut col = 0usize;
-
-    for terminal_span in row {
-        let style = style_from_terminal_cell(terminal_span.style, palette);
-        let chars = terminal_span.text.chars().collect::<Vec<_>>();
-        let len = chars.len();
-
-        if !cursor_drawn && cursor_col >= col && cursor_col < col.saturating_add(len) {
-            let local_col = cursor_col - col;
-
-            if local_col > 0 {
-                spans.push(Span::styled(
-                    chars[..local_col].iter().collect::<String>(),
-                    style,
-                ));
+impl Widget for TerminalPaletteDefaults {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                let cell = &mut buf[(x, y)];
+                if cell.fg == Color::Reset {
+                    cell.set_fg(self.default_fg);
+                }
+                if cell.bg == Color::Reset {
+                    cell.set_bg(self.default_bg);
+                }
             }
+        }
+    }
+}
 
-            spans.push(Span::styled(
-                chars[local_col].to_string(),
-                terminal_cursor_style(palette),
-            ));
-
-            if local_col + 1 < len {
-                spans.push(Span::styled(
-                    chars[local_col + 1..].iter().collect::<String>(),
-                    style,
-                ));
-            }
-
-            cursor_drawn = true;
-        } else if !terminal_span.text.is_empty() {
-            spans.push(Span::styled(terminal_span.text, style));
+impl Widget for CopyModeOverlay {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
         }
 
-        col = col.saturating_add(len);
-    }
+        let width = area.width as usize;
+        let max_row = area.height as usize;
+        let mut fill_row_bg = |row: usize, color: Color| {
+            let y = area.y + row as u16;
+            for col in 0..width {
+                let x = area.x + col as u16;
+                buf[(x, y)].set_bg(color);
+            }
+        };
 
-    if !cursor_drawn {
-        spans.push(Span::styled(" ", terminal_cursor_style(palette)));
-    }
+        if let Some((start, end)) = self.selection_rows {
+            let start = start.min(max_row.saturating_sub(1));
+            let end = end.min(max_row.saturating_sub(1));
 
-    spans
+            for row in start..=end {
+                fill_row_bg(row, self.selection_bg);
+            }
+        }
+
+        let cursor_row = self.cursor.0.min(max_row.saturating_sub(1));
+        let cursor_col = self.cursor.1.min(width.saturating_sub(1));
+        let y = area.y + cursor_row as u16;
+
+        fill_row_bg(cursor_row, self.cursor_row_bg);
+
+        let x = area.x + cursor_col as u16;
+
+        let cell = &mut buf[(x, y)];
+        if cell.symbol().is_empty() {
+            cell.set_symbol(" ");
+        }
+        cell.set_style(self.cursor_style);
+    }
 }
 
 fn terminal_cursor_style(palette: &Palette) -> Style {
@@ -607,73 +519,4 @@ fn terminal_cursor_style(palette: &Palette) -> Style {
         .fg(rgb(palette.modal_bg))
         .bg(rgb(palette.border_focus))
         .add_modifier(Modifier::BOLD)
-}
-
-fn style_from_terminal_cell(style: TerminalCellStyle, palette: &Palette) -> Style {
-    let default_fg = rgb(palette.text);
-    let default_bg = rgb(palette.modal_bg);
-    let mut fg = vt_color_to_tui(style.fg, default_fg);
-    let mut bg = vt_color_to_tui(style.bg, default_bg);
-
-    if style.inverse {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-
-    let mut resolved = Style::default().fg(fg).bg(bg);
-    if style.bold {
-        resolved = resolved.add_modifier(Modifier::BOLD);
-    }
-    if style.italic {
-        resolved = resolved.add_modifier(Modifier::ITALIC);
-    }
-    if style.underline {
-        resolved = resolved.add_modifier(Modifier::UNDERLINED);
-    }
-
-    resolved
-}
-
-fn vt_color_to_tui(color: VtColor, default: ratatui::style::Color) -> ratatui::style::Color {
-    match color {
-        VtColor::Default => default,
-        VtColor::Rgb(r, g, b) => ratatui::style::Color::Rgb(r, g, b),
-        VtColor::Idx(idx) => indexed_color(idx),
-    }
-}
-
-fn indexed_color(idx: u8) -> ratatui::style::Color {
-    match idx {
-        0 => ratatui::style::Color::Rgb(0, 0, 0),
-        1 => ratatui::style::Color::Rgb(205, 49, 49),
-        2 => ratatui::style::Color::Rgb(13, 188, 121),
-        3 => ratatui::style::Color::Rgb(229, 229, 16),
-        4 => ratatui::style::Color::Rgb(36, 114, 200),
-        5 => ratatui::style::Color::Rgb(188, 63, 188),
-        6 => ratatui::style::Color::Rgb(17, 168, 205),
-        7 => ratatui::style::Color::Rgb(229, 229, 229),
-        8 => ratatui::style::Color::Rgb(102, 102, 102),
-        9 => ratatui::style::Color::Rgb(241, 76, 76),
-        10 => ratatui::style::Color::Rgb(35, 209, 139),
-        11 => ratatui::style::Color::Rgb(245, 245, 67),
-        12 => ratatui::style::Color::Rgb(59, 142, 234),
-        13 => ratatui::style::Color::Rgb(214, 112, 214),
-        14 => ratatui::style::Color::Rgb(41, 184, 219),
-        15 => ratatui::style::Color::Rgb(255, 255, 255),
-        16..=231 => {
-            let index = idx - 16;
-            let r = index / 36;
-            let g = (index % 36) / 6;
-            let b = index % 6;
-
-            let channel = |value: u8| {
-                if value == 0 { 0 } else { value * 40 + 55 }
-            };
-
-            ratatui::style::Color::Rgb(channel(r), channel(g), channel(b))
-        }
-        232..=255 => {
-            let gray = (idx - 232) * 10 + 8;
-            ratatui::style::Color::Rgb(gray, gray, gray)
-        }
-    }
 }

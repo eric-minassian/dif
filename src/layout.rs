@@ -127,17 +127,7 @@ pub fn help_popup(area: Rect) -> Rect {
 }
 
 pub fn terminal_output_area(area: Rect) -> Rect {
-    let popup = terminal_popup(area);
-    let inner = bordered_inner(popup);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    sections[1]
+    bordered_inner(terminal_popup(area))
 }
 
 pub fn bordered_inner(area: Rect) -> Rect {

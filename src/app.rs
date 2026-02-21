@@ -12,7 +12,7 @@ use crate::settings::{
     self, AUTO_SPLIT_MIN_WIDTH_MAX, AUTO_SPLIT_MIN_WIDTH_MIN, AppSettings, DiffViewMode,
     SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
 };
-use crate::terminal::{TerminalSession, TerminalStyledRow};
+use crate::terminal::TerminalSession;
 
 mod status;
 mod util;
@@ -570,18 +570,10 @@ impl App {
 
         self.settings_open = false;
         self.help_open = false;
-        self.terminal_open = false;
-        self.terminal_copy_mode = false;
-        self.terminal_search_open = false;
-        self.terminal_search_query.clear();
-        self.terminal_selection_anchor = None;
+        self.hide_terminal_panel();
 
         self.git_panel_open = true;
-        self.git_panel_mode = GitPanelMode::Browse;
-        self.pending_branch_delete = None;
-        self.git_branch_input.clear();
-        self.git_commit_input.clear();
-        self.git_commit_cursor = 0;
+        self.reset_git_panel_state();
 
         self.refresh()?;
         self.set_status_info("Git panel open");
@@ -591,11 +583,7 @@ impl App {
     pub fn close_git_panel(&mut self) {
         if self.git_panel_open {
             self.git_panel_open = false;
-            self.git_panel_mode = GitPanelMode::Browse;
-            self.pending_branch_delete = None;
-            self.git_branch_input.clear();
-            self.git_commit_input.clear();
-            self.git_commit_cursor = 0;
+            self.reset_git_panel_state();
             self.set_status_info("Git panel closed");
         }
     }
@@ -610,16 +598,11 @@ impl App {
     pub fn open_commit_prompt(&mut self) -> Result<()> {
         self.settings_open = false;
         self.help_open = false;
-        self.terminal_open = false;
-        self.terminal_copy_mode = false;
-        self.terminal_search_open = false;
-        self.terminal_search_query.clear();
-        self.terminal_selection_anchor = None;
+        self.hide_terminal_panel();
 
         self.git_panel_open = true;
+        self.reset_git_panel_state();
         self.git_panel_mode = GitPanelMode::CommitMessage;
-        self.pending_branch_delete = None;
-        self.git_branch_input.clear();
         let template = git::commit_template(&self.repo_root)?.unwrap_or_default();
         self.git_commit_input = normalize_newlines(&template);
         self.git_commit_cursor = initial_commit_cursor(&self.git_commit_input);
@@ -633,19 +616,18 @@ impl App {
         match self.git_panel_mode {
             GitPanelMode::Browse => self.close_git_panel(),
             GitPanelMode::CreateBranch => {
-                self.git_panel_mode = GitPanelMode::Browse;
+                self.set_git_panel_browse_mode();
                 self.git_branch_input.clear();
                 self.set_status_info("Create branch cancelled");
             }
             GitPanelMode::CommitMessage => {
-                self.git_panel_mode = GitPanelMode::Browse;
+                self.set_git_panel_browse_mode();
                 self.git_commit_input.clear();
                 self.git_commit_cursor = 0;
                 self.set_status_info("Commit cancelled");
             }
             GitPanelMode::ConfirmDeleteBranch => {
-                self.git_panel_mode = GitPanelMode::Browse;
-                self.pending_branch_delete = None;
+                self.set_git_panel_browse_mode();
                 self.set_status_info("Delete branch cancelled");
             }
         }
@@ -684,8 +666,7 @@ impl App {
         }
 
         git::create_branch(&self.repo_root, &branch_name)?;
-        self.git_panel_mode = GitPanelMode::Browse;
-        self.pending_branch_delete = None;
+        self.set_git_panel_browse_mode();
         self.git_branch_input.clear();
         self.refresh()?;
         self.set_status_info(format!("Created and switched to {branch_name}"));
@@ -704,8 +685,7 @@ impl App {
         }
 
         git::switch_branch(&self.repo_root, &branch.name)?;
-        self.git_panel_mode = GitPanelMode::Browse;
-        self.pending_branch_delete = None;
+        self.set_git_panel_browse_mode();
         self.refresh()?;
         self.set_status_info(format!("Switched to {}", branch.name));
         Ok(())
@@ -736,13 +716,12 @@ impl App {
 
     pub fn confirm_delete_selected_branch(&mut self) -> Result<()> {
         let Some(branch_name) = self.pending_branch_delete.clone() else {
-            self.git_panel_mode = GitPanelMode::Browse;
+            self.set_git_panel_browse_mode();
             return Ok(());
         };
 
         git::delete_branch(&self.repo_root, &branch_name)?;
-        self.pending_branch_delete = None;
-        self.git_panel_mode = GitPanelMode::Browse;
+        self.set_git_panel_browse_mode();
         self.refresh()?;
         self.set_status_info(format!("Deleted branch {branch_name}"));
         Ok(())
@@ -821,8 +800,7 @@ impl App {
         let message = self.git_commit_input.clone();
 
         git::commit(&self.repo_root, &message)?;
-        self.pending_branch_delete = None;
-        self.git_panel_mode = GitPanelMode::Browse;
+        self.set_git_panel_browse_mode();
         self.git_commit_input.clear();
         self.git_commit_cursor = 0;
         self.refresh()?;
@@ -855,26 +833,15 @@ impl App {
         self.settings_open = false;
         self.help_open = false;
         self.git_panel_open = false;
-        self.git_panel_mode = GitPanelMode::Browse;
-        self.pending_branch_delete = None;
-        self.git_branch_input.clear();
-        self.git_commit_input.clear();
-        self.git_commit_cursor = 0;
+        self.reset_git_panel_state();
+        self.hide_terminal_panel();
         self.terminal_open = true;
-        self.terminal_copy_mode = false;
-        self.terminal_search_open = false;
-        self.terminal_search_query.clear();
-        self.terminal_selection_anchor = None;
-        self.terminal_cursor_row = 0;
-        self.terminal_cursor_col = 0;
-        self.terminal_scrollback = 0;
+        self.reset_terminal_navigation_state();
 
-        self.ensure_live_terminal_session()?;
-        if let Some(session) = self.terminal_session.as_mut() {
-            session.set_scrollback(0);
-            session.pump_output();
-            self.terminal_scrollback = session.scrollback();
-        }
+        let session = self.ensure_live_terminal_session()?;
+        session.set_scrollback(0);
+        session.pump_output();
+        self.terminal_scrollback = session.scrollback();
 
         self.set_status_info("Terminal open (interactive)");
         Ok(())
@@ -882,14 +849,8 @@ impl App {
 
     pub fn close_terminal(&mut self) {
         if self.terminal_open {
-            self.terminal_open = false;
-            self.terminal_copy_mode = false;
-            self.terminal_search_open = false;
-            self.terminal_search_query.clear();
-            self.terminal_selection_anchor = None;
-            self.terminal_scrollback = 0;
-            self.terminal_cursor_row = 0;
-            self.terminal_cursor_col = 0;
+            self.hide_terminal_panel();
+            self.reset_terminal_navigation_state();
             self.terminal_view_rows = 0;
             self.terminal_view_cols = 0;
             self.terminal_session = None;
@@ -901,19 +862,11 @@ impl App {
     }
 
     pub fn terminal_send_key(&mut self, key: KeyEvent) -> Result<()> {
-        let session = self.ensure_live_terminal_session()?;
-        session.send_key(key)?;
-        session.pump_output();
-        self.terminal_scrollback = session.scrollback();
-        Ok(())
+        self.with_live_terminal_session(|session| session.send_key(key))
     }
 
     pub fn terminal_send_text(&mut self, text: &str) -> Result<()> {
-        let session = self.ensure_live_terminal_session()?;
-        session.send_text(text)?;
-        session.pump_output();
-        self.terminal_scrollback = session.scrollback();
-        Ok(())
+        self.with_live_terminal_session(|session| session.send_text(text))
     }
 
     pub fn terminal_resize(&mut self, rows: u16, cols: u16) -> Result<()> {
@@ -923,18 +876,17 @@ impl App {
         Ok(())
     }
 
-    pub fn terminal_rows(&self) -> Vec<TerminalStyledRow> {
-        self.terminal_session
-            .as_ref()
-            .map(TerminalSession::styled_rows)
-            .unwrap_or_default()
+    pub fn terminal_screen(&self) -> Option<&vt100::Screen> {
+        self.terminal_session.as_ref().map(TerminalSession::screen)
     }
 
-    pub fn terminal_plain_rows(&self) -> Vec<String> {
-        self.terminal_session
-            .as_ref()
-            .map(TerminalSession::plain_rows)
-            .unwrap_or_default()
+    fn terminal_rows_snapshot(&self) -> Vec<String> {
+        let Some(screen) = self.terminal_screen() else {
+            return Vec::new();
+        };
+
+        let (_, cols) = screen.size();
+        screen.rows(0, cols).collect()
     }
 
     pub fn scroll_terminal(&mut self, delta: isize) {
@@ -1030,38 +982,36 @@ impl App {
     }
 
     pub fn terminal_yank_selection(&mut self) -> Result<()> {
-        let Some(anchor) = self.terminal_selection_anchor else {
+        let Some(((start_row, start_col), (end_row, end_col))) = self.terminal_selection_bounds()
+        else {
             self.set_status_warn("No selection anchor; press v first");
             return Ok(());
         };
 
-        let rows = self.terminal_plain_rows();
+        let rows = self.terminal_rows_snapshot();
         if rows.is_empty() {
             self.set_status_warn("Nothing to copy");
             return Ok(());
         }
 
-        let cursor = (self.terminal_cursor_row, self.terminal_cursor_col);
-        let ((start_row, start_col), (end_row, end_col)) = order_positions(anchor, cursor);
-
         let mut out = String::new();
         for row_idx in start_row..=end_row {
             let line = rows.get(row_idx).map(String::as_str).unwrap_or("");
-            let chars = line.chars().collect::<Vec<_>>();
+            let line_len = line.chars().count();
 
             let from = if row_idx == start_row {
-                start_col.min(chars.len())
+                start_col.min(line_len)
             } else {
                 0
             };
             let to_exclusive = if row_idx == end_row {
-                end_col.saturating_add(1).min(chars.len())
+                end_col.saturating_add(1).min(line_len)
             } else {
-                chars.len()
+                line_len
             };
 
             if from < to_exclusive {
-                out.extend(chars[from..to_exclusive].iter());
+                out.extend(line.chars().skip(from).take(to_exclusive - from));
             }
 
             if row_idx < end_row {
@@ -1120,7 +1070,7 @@ impl App {
         self.terminal_last_search = query.clone();
         self.terminal_search_open = false;
 
-        let rows = self.terminal_plain_rows();
+        let rows = self.terminal_rows_snapshot();
         if rows.is_empty() {
             self.set_status_warn("No terminal output to search");
             return;
@@ -1129,31 +1079,13 @@ impl App {
         let start_row = self.terminal_cursor_row.min(rows.len().saturating_sub(1));
         let start_col = self.terminal_cursor_col.saturating_add(1);
 
-        let mut found = None;
-
-        for pass in 0..2 {
-            let row_iter: Box<dyn Iterator<Item = usize>> = if pass == 0 {
-                Box::new(start_row..rows.len())
-            } else {
-                Box::new(0..start_row)
-            };
-
-            for row_idx in row_iter {
-                let col_start = if pass == 0 && row_idx == start_row {
-                    start_col
-                } else {
-                    0
-                };
-                if let Some(col_idx) = find_query_in_line(&rows[row_idx], &query, col_start) {
-                    found = Some((row_idx, col_idx));
-                    break;
-                }
-            }
-
-            if found.is_some() {
-                break;
-            }
-        }
+        let found = (start_row..rows.len())
+            .chain(0..start_row)
+            .find_map(|row_idx| {
+                let col_start = if row_idx == start_row { start_col } else { 0 };
+                find_query_in_line(&rows[row_idx], &query, col_start)
+                    .map(|col_idx| (row_idx, col_idx))
+            });
 
         if let Some((row_idx, col_idx)) = found {
             self.terminal_cursor_row = row_idx.min(self.terminal_view_rows.saturating_sub(1));
@@ -1168,56 +1100,34 @@ impl App {
         (self.terminal_cursor_row, self.terminal_cursor_col)
     }
 
-    pub fn terminal_shell_cursor(&self) -> Option<(usize, usize)> {
-        let session = self.terminal_session.as_ref()?;
-        if session.cursor_hidden() {
-            None
-        } else {
-            Some(session.cursor_position())
-        }
+    fn terminal_selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.terminal_selection_anchor.map(|anchor| {
+            order_positions(anchor, (self.terminal_cursor_row, self.terminal_cursor_col))
+        })
     }
 
     pub fn terminal_selection_rows(&self) -> Option<(usize, usize)> {
-        self.terminal_selection_anchor.map(|(anchor_row, _)| {
-            let start = anchor_row.min(self.terminal_cursor_row);
-            let end = anchor_row.max(self.terminal_cursor_row);
-            (start, end)
-        })
+        self.terminal_selection_bounds()
+            .map(|((start_row, _), (end_row, _))| (start_row, end_row))
     }
 
     pub fn toggle_settings_panel(&mut self) {
         self.help_open = false;
-        self.terminal_open = false;
-        self.terminal_copy_mode = false;
-        self.terminal_search_open = false;
-        self.terminal_search_query.clear();
-        self.terminal_selection_anchor = None;
+        self.hide_terminal_panel();
         self.git_panel_open = false;
-        self.git_panel_mode = GitPanelMode::Browse;
-        self.pending_branch_delete = None;
-        self.git_branch_input.clear();
-        self.git_commit_input.clear();
-        self.git_commit_cursor = 0;
+        self.reset_git_panel_state();
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.set_status_info("Settings open");
         } else {
-            if let Err(error) = self.flush_settings_if_dirty() {
-                self.set_status_error(error);
-                return;
-            }
-            self.set_status_info("Settings closed");
+            self.finish_close_settings_panel();
         }
     }
 
     pub fn close_settings_panel(&mut self) {
         if self.settings_open {
             self.settings_open = false;
-            if let Err(error) = self.flush_settings_if_dirty() {
-                self.set_status_error(error);
-                return;
-            }
-            self.set_status_info("Settings closed");
+            self.finish_close_settings_panel();
         }
     }
 
@@ -1315,11 +1225,7 @@ impl App {
             ),
             (
                 "Sidebar Visible",
-                if self.settings.sidebar_visible {
-                    String::from("Yes")
-                } else {
-                    String::from("No")
-                },
+                yes_no_label(self.settings.sidebar_visible).to_owned(),
             ),
             (
                 "Sidebar Side",
@@ -1328,16 +1234,12 @@ impl App {
             ("Sidebar Width", self.settings.sidebar_width.to_string()),
             (
                 "Auto Split Min Width",
-                format!("{}", self.settings.auto_split_min_width),
+                self.settings.auto_split_min_width.to_string(),
             ),
             ("Theme", self.settings.theme.label().to_owned()),
             (
                 "Confirm Undo",
-                if self.settings.confirm_undo_to_mainline {
-                    String::from("Yes")
-                } else {
-                    String::from("No")
-                },
+                yes_no_label(self.settings.confirm_undo_to_mainline).to_owned(),
             ),
         ]
     }
@@ -1698,6 +1600,40 @@ impl App {
         Ok(())
     }
 
+    fn finish_close_settings_panel(&mut self) {
+        if let Err(error) = self.flush_settings_if_dirty() {
+            self.set_status_error(error);
+            return;
+        }
+        self.set_status_info("Settings closed");
+    }
+
+    fn hide_terminal_panel(&mut self) {
+        self.terminal_open = false;
+        self.terminal_copy_mode = false;
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.terminal_selection_anchor = None;
+    }
+
+    fn reset_terminal_navigation_state(&mut self) {
+        self.terminal_scrollback = 0;
+        self.terminal_cursor_row = 0;
+        self.terminal_cursor_col = 0;
+    }
+
+    fn reset_git_panel_state(&mut self) {
+        self.set_git_panel_browse_mode();
+        self.git_branch_input.clear();
+        self.git_commit_input.clear();
+        self.git_commit_cursor = 0;
+    }
+
+    fn set_git_panel_browse_mode(&mut self) {
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.pending_branch_delete = None;
+    }
+
     fn ensure_live_terminal_session(&mut self) -> Result<&mut TerminalSession> {
         let must_start = self
             .terminal_session
@@ -1713,6 +1649,17 @@ impl App {
         self.terminal_session
             .as_mut()
             .ok_or_else(|| anyhow!("terminal session should exist after initialization"))
+    }
+
+    fn with_live_terminal_session<F>(&mut self, action: F) -> Result<()>
+    where
+        F: FnOnce(&mut TerminalSession) -> Result<()>,
+    {
+        let session = self.ensure_live_terminal_session()?;
+        action(session)?;
+        session.pump_output();
+        self.terminal_scrollback = session.scrollback();
+        Ok(())
     }
 
     fn auto_refresh_if_due(&mut self) -> Result<()> {
@@ -1935,4 +1882,8 @@ fn initial_commit_cursor(template: &str) -> usize {
     }
 
     0
+}
+
+fn yes_no_label(value: bool) -> &'static str {
+    if value { "Yes" } else { "No" }
 }

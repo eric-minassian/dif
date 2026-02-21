@@ -6,27 +6,9 @@ use std::sync::mpsc::{self, Receiver};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use vt100::{Color, Parser};
+use vt100::Parser;
 
 const SCROLLBACK_LEN: usize = 20_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TerminalCellStyle {
-    pub fg: Color,
-    pub bg: Color,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub inverse: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalSpan {
-    pub text: String,
-    pub style: TerminalCellStyle,
-}
-
-pub type TerminalStyledRow = Vec<TerminalSpan>;
 
 pub struct TerminalSession {
     parser: Parser,
@@ -163,66 +145,8 @@ impl TerminalSession {
         self.parser.screen().scrollback()
     }
 
-    pub fn styled_rows(&self) -> Vec<TerminalStyledRow> {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let mut rendered = Vec::with_capacity(rows as usize);
-
-        for row in 0..rows {
-            let mut spans: TerminalStyledRow = Vec::new();
-
-            for col in 0..cols {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-
-                let text = if cell.has_contents() {
-                    cell.contents()
-                } else {
-                    String::from(" ")
-                };
-
-                let style = TerminalCellStyle {
-                    fg: cell.fgcolor(),
-                    bg: cell.bgcolor(),
-                    bold: cell.bold(),
-                    italic: cell.italic(),
-                    underline: cell.underline(),
-                    inverse: cell.inverse(),
-                };
-
-                if let Some(last) = spans.last_mut()
-                    && last.style == style
-                {
-                    last.text.push_str(&text);
-                    continue;
-                }
-
-                spans.push(TerminalSpan { text, style });
-            }
-
-            rendered.push(spans);
-        }
-
-        rendered
-    }
-
-    pub fn plain_rows(&self) -> Vec<String> {
-        let screen = self.parser.screen();
-        let (_, cols) = screen.size();
-        screen.rows(0, cols).collect()
-    }
-
-    pub fn cursor_position(&self) -> (usize, usize) {
-        let (row, col) = self.parser.screen().cursor_position();
-        (row as usize, col as usize)
-    }
-
-    pub fn cursor_hidden(&self) -> bool {
-        self.parser.screen().hide_cursor()
+    pub fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
     }
 
     pub fn is_exited(&self) -> bool {
