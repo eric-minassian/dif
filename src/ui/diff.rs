@@ -23,24 +23,14 @@ pub(crate) fn render_diff_header(
     frame: &mut Frame,
     app: &App,
     area: Rect,
-    resolved_layout: ResolvedDiffLayout,
-    diff_width: u16,
+    _resolved_layout: ResolvedDiffLayout,
+    _diff_width: u16,
     palette: &Palette,
 ) {
+    let (added, removed) = app.active_diff_line_counts();
     let text = match app.active_path() {
-        Some(path) => format!(
-            "{} ({}) [{}]",
-            path,
-            app.active_label(),
-            app.diff_mode_hint(diff_width)
-        ),
-        None => format!(
-            "No file selected [{}]",
-            match app.settings.diff_view_mode {
-                crate::settings::DiffViewMode::Auto => format!("Auto->{}", resolved_layout.label()),
-                mode => mode.label().to_owned(),
-            }
-        ),
+        Some(path) => format!("{path} [{}]  +{added} -{removed}", app.active_label()),
+        None => String::from("No file selected"),
     };
     let header = Paragraph::new(text).style(Style::default().fg(rgb(palette.dim)));
     frame.render_widget(header, area);
@@ -102,7 +92,11 @@ pub(crate) fn render_split_diff_panes(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Old ")
+                .title(if app.pane_focus == PaneFocus::Diff {
+                    " Old [active] "
+                } else {
+                    " Old "
+                })
                 .border_style(diff_border),
         )
         .style(pane_style)
@@ -111,7 +105,11 @@ pub(crate) fn render_split_diff_panes(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" New ")
+                .title(if app.pane_focus == PaneFocus::Diff {
+                    " New [active] "
+                } else {
+                    " New "
+                })
                 .border_style(diff_border),
         )
         .style(pane_style)
@@ -180,7 +178,11 @@ pub(crate) fn render_unified_diff_pane(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Diff ")
+                .title(if app.pane_focus == PaneFocus::Diff {
+                    " Diff [active] "
+                } else {
+                    " Diff "
+                })
                 .border_style(diff_border),
         )
         .style(pane_style)

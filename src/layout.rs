@@ -10,6 +10,8 @@ pub const GIT_MODAL_WIDTH_PERCENT: u16 = 72;
 pub const GIT_MODAL_HEIGHT_PERCENT: u16 = 72;
 pub const SETTINGS_MODAL_WIDTH_PERCENT: u16 = 70;
 pub const SETTINGS_MODAL_HEIGHT_PERCENT: u16 = 60;
+pub const HELP_MODAL_WIDTH_PERCENT: u16 = 76;
+pub const HELP_MODAL_HEIGHT_PERCENT: u16 = 74;
 
 pub fn split_root(root: Rect) -> (Rect, Rect) {
     let rows = Layout::default()
@@ -118,6 +120,10 @@ pub fn settings_popup(area: Rect) -> Rect {
 
 pub fn git_popup(area: Rect) -> Rect {
     centered_rect(GIT_MODAL_WIDTH_PERCENT, GIT_MODAL_HEIGHT_PERCENT, area)
+}
+
+pub fn help_popup(area: Rect) -> Rect {
+    centered_rect(HELP_MODAL_WIDTH_PERCENT, HELP_MODAL_HEIGHT_PERCENT, area)
 }
 
 pub fn terminal_output_area(area: Rect) -> Rect {

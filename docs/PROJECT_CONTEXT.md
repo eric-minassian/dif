@@ -6,7 +6,7 @@ This file captures practical usage/context that is intentionally kept outside `R
 
 `dif` is a TUI for fast staging workflows:
 
-- inspect unstaged and staged files side by side
+- inspect changed files in a single tree view with staged/unstaged markers
 - inspect split or unified file diffs with syntax highlighting
 - stage/unstage/undo selected files quickly
 - open an embedded shell in the same repo context without leaving the app
@@ -32,9 +32,12 @@ confirm_undo_to_mainline = true
 
 ## Core interaction model
 
-- Focus alternates between Unstaged and Staged lists (`Tab`)
-- Pane focus alternates between sidebar and diff (`Left`/`Right`)
+- Focus toggles between sidebar tree and diff (`Tab`, reverse with `Shift+Tab`)
+- Pane focus alternates between sidebar and diff (`Left`/`Right` or `h`/`l`)
 - Selection movement uses arrows or vim keys (`j`/`k`)
+- Stage toggle is contextual on current list (`Enter` or `Space`)
+- Sidebar always uses a single tree list with staged/unstaged markers
+- Quick help overlay is available from most non-text-input contexts (`?` or `F1`)
 - Terminal modal opens with `:` or `!`
 - Settings modal opens with `o`
 

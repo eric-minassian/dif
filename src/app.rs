@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
-use crate::diff::{DiffRow, parse_unified_diff, unified_line_count};
+use crate::diff::{CellKind, DiffRow, parse_unified_diff, unified_line_count};
 use crate::git::{self, BranchEntry, DiffMode, FileEntry, UnstagedKind};
 use crate::layout;
 use crate::settings::{
@@ -67,6 +67,7 @@ impl ResolvedDiffLayout {
 pub struct UiLayout {
     pub unstaged_inner: Rect,
     pub staged_inner: Rect,
+    pub tree_inner: Rect,
     pub diff_area: Rect,
     pub diff_viewport_height: usize,
 }
@@ -76,10 +77,19 @@ impl Default for UiLayout {
         Self {
             unstaged_inner: Rect::new(0, 0, 0, 0),
             staged_inner: Rect::new(0, 0, 0, 0),
+            tree_inner: Rect::new(0, 0, 0, 0),
             diff_area: Rect::new(0, 0, 0, 0),
             diff_viewport_height: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TreeFileEntry {
+    pub path: String,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +105,7 @@ pub struct App {
     last_settings_change: Option<Instant>,
     pub settings: AppSettings,
     pub settings_open: bool,
+    pub help_open: bool,
     pub settings_selected: usize,
     pub git_panel_open: bool,
     pub git_panel_mode: GitPanelMode,
@@ -121,8 +132,11 @@ pub struct App {
     pub pane_focus: PaneFocus,
     pub unstaged_selected: Option<usize>,
     pub staged_selected: Option<usize>,
+    pub tree_selected: Option<usize>,
     pub unstaged_scroll: usize,
     pub staged_scroll: usize,
+    pub tree_scroll: usize,
+    pub tree_files: Vec<TreeFileEntry>,
     pub diff_rows: Vec<DiffRow>,
     pub diff_scroll: usize,
     pub diff_content_height: usize,
@@ -149,6 +163,7 @@ impl App {
             last_settings_change: None,
             settings,
             settings_open: false,
+            help_open: false,
             settings_selected: 0,
             git_panel_open: false,
             git_panel_mode: GitPanelMode::Browse,
@@ -175,8 +190,11 @@ impl App {
             pane_focus: PaneFocus::Sidebar,
             unstaged_selected: None,
             staged_selected: None,
+            tree_selected: None,
             unstaged_scroll: 0,
             staged_scroll: 0,
+            tree_scroll: 0,
+            tree_files: Vec::new(),
             diff_rows: Vec::new(),
             diff_scroll: 0,
             diff_content_height: 0,
@@ -200,6 +218,7 @@ impl App {
     pub fn refresh(&mut self) -> Result<()> {
         let previous_unstaged = self.selected_unstaged_path().map(ToOwned::to_owned);
         let previous_staged = self.selected_staged_path().map(ToOwned::to_owned);
+        let previous_tree = self.selected_tree_path().map(ToOwned::to_owned);
         let previous_branch = self.selected_branch_name().map(ToOwned::to_owned);
         let previous_active = self.active_selection();
         let previous_diff_scroll = self.diff_scroll;
@@ -209,6 +228,7 @@ impl App {
         self.staged = status.staged;
         self.branches = git::list_local_branches(&self.repo_root)?;
 
+        self.restore_tree_selection(previous_tree);
         self.restore_unstaged_selection(previous_unstaged);
         self.restore_staged_selection(previous_staged);
         self.restore_branch_selection(previous_branch);
@@ -284,6 +304,25 @@ impl App {
         self.load_current_diff()
     }
 
+    pub fn cycle_focus_ring(&mut self, delta: isize) -> Result<()> {
+        if !self.has_sidebar() {
+            self.pane_focus = PaneFocus::Diff;
+            return Ok(());
+        }
+
+        let mut remaining = delta.unsigned_abs().max(1);
+        while remaining > 0 {
+            self.pane_focus = match self.pane_focus {
+                PaneFocus::Sidebar => PaneFocus::Diff,
+                PaneFocus::Diff => PaneFocus::Sidebar,
+            };
+            remaining -= 1;
+        }
+
+        self.normalize_focus();
+        self.load_current_diff()
+    }
+
     pub fn move_selection(&mut self, delta: isize) -> Result<()> {
         let list_len = self.focus_len();
         if list_len == 0 {
@@ -301,16 +340,94 @@ impl App {
         self.load_current_diff()
     }
 
-    pub fn stage_selected(&mut self) -> Result<()> {
-        if self.focus != FocusSection::Unstaged {
-            self.set_status_warn("Focus Unstaged to stage files");
+    pub fn move_selection_page(&mut self, delta_pages: isize) -> Result<()> {
+        let visible = (self.layout.tree_inner.height as usize)
+            .saturating_sub(1)
+            .max(1);
+
+        self.move_selection((visible as isize).saturating_mul(delta_pages))
+    }
+
+    pub fn jump_selection_to_edge(&mut self, to_end: bool) -> Result<()> {
+        let len = self.focus_len();
+        if len == 0 {
             return Ok(());
         }
 
-        let Some(entry) = self.selected_unstaged().cloned() else {
-            self.set_status_warn("No unstaged file selected");
+        let idx = if to_end { len - 1 } else { 0 };
+        self.set_focus_selected(Some(idx));
+        self.load_current_diff()
+    }
+
+    pub fn scroll_diff_page(&mut self, delta_pages: isize) {
+        let step = self.layout.diff_viewport_height.max(1) as isize;
+        self.scroll_diff(step.saturating_mul(delta_pages));
+    }
+
+    pub fn jump_diff_to_edge(&mut self, to_end: bool) {
+        if !to_end {
+            self.diff_scroll = 0;
+            self.sync_scrolls();
+            return;
+        }
+
+        self.diff_scroll = self
+            .diff_content_height
+            .saturating_sub(self.layout.diff_viewport_height.max(1));
+        self.sync_scrolls();
+    }
+
+    pub fn jump_focused_area_to_edge(&mut self, to_end: bool) -> Result<()> {
+        if self.is_diff_focused() {
+            self.jump_diff_to_edge(to_end);
+            Ok(())
+        } else {
+            self.jump_selection_to_edge(to_end)
+        }
+    }
+
+    pub fn toggle_stage_state(&mut self) -> Result<()> {
+        let Some(entry) = self.selected_tree_file().cloned() else {
+            self.set_status_warn("No file selected");
             return Ok(());
         };
+
+        if entry.unstaged {
+            git::stage_file(&self.repo_root, &entry.path)?;
+            self.refresh()?;
+            self.set_status_info(format!("Staged {}", entry.path));
+            return Ok(());
+        }
+
+        if entry.staged {
+            git::unstage_file(&self.repo_root, &entry.path)?;
+            self.refresh()?;
+            self.set_status_info(format!("Unstaged {}", entry.path));
+            return Ok(());
+        }
+
+        self.set_status_warn("Selected file has no staged or unstaged changes");
+        Ok(())
+    }
+
+    pub fn toggle_help_panel(&mut self) {
+        self.help_open = !self.help_open;
+    }
+
+    pub fn close_help_panel(&mut self) {
+        self.help_open = false;
+    }
+
+    pub fn stage_selected(&mut self) -> Result<()> {
+        let Some(entry) = self.selected_tree_file().cloned() else {
+            self.set_status_warn("No file selected");
+            return Ok(());
+        };
+
+        if !entry.unstaged {
+            self.set_status_warn("Selected file has no unstaged changes");
+            return Ok(());
+        }
 
         git::stage_file(&self.repo_root, &entry.path)?;
         self.refresh()?;
@@ -319,19 +436,19 @@ impl App {
     }
 
     pub fn unstage_selected(&mut self) -> Result<()> {
-        if self.focus != FocusSection::Staged {
-            self.set_status_warn("Focus Staged to unstage files");
-            return Ok(());
-        }
-
-        let Some(path) = self.selected_staged_path().map(ToOwned::to_owned) else {
-            self.set_status_warn("No staged file selected");
+        let Some(entry) = self.selected_tree_file().cloned() else {
+            self.set_status_warn("No file selected");
             return Ok(());
         };
 
-        git::unstage_file(&self.repo_root, &path)?;
+        if !entry.staged {
+            self.set_status_warn("Selected file has no staged changes");
+            return Ok(());
+        }
+
+        git::unstage_file(&self.repo_root, &entry.path)?;
         self.refresh()?;
-        self.set_status_info(format!("Unstaged {path}"));
+        self.set_status_info(format!("Unstaged {}", entry.path));
         Ok(())
     }
 
@@ -343,7 +460,7 @@ impl App {
         if self.settings.confirm_undo_to_mainline {
             self.pending_undo_confirmation = Some(target.clone());
             self.set_status_warn(format!(
-                "Undo {} to mainline? Press y to confirm, n/Esc to cancel",
+                "Undo {} to mainline? Press Enter/y to confirm, n/Esc to cancel",
                 target.path
             ));
             return Ok(());
@@ -452,6 +569,7 @@ impl App {
         }
 
         self.settings_open = false;
+        self.help_open = false;
         self.terminal_open = false;
         self.terminal_copy_mode = false;
         self.terminal_search_open = false;
@@ -491,6 +609,7 @@ impl App {
 
     pub fn open_commit_prompt(&mut self) -> Result<()> {
         self.settings_open = false;
+        self.help_open = false;
         self.terminal_open = false;
         self.terminal_copy_mode = false;
         self.terminal_search_open = false;
@@ -609,7 +728,10 @@ impl App {
 
         self.pending_branch_delete = Some(branch_name.clone());
         self.git_panel_mode = GitPanelMode::ConfirmDeleteBranch;
-        self.set_status_warn(format!("Delete branch {}? Press y to confirm", branch_name));
+        self.set_status_warn(format!(
+            "Delete branch {}? Press Enter/y to confirm",
+            branch_name
+        ));
     }
 
     pub fn confirm_delete_selected_branch(&mut self) -> Result<()> {
@@ -731,6 +853,7 @@ impl App {
 
     pub fn open_terminal(&mut self) -> Result<()> {
         self.settings_open = false;
+        self.help_open = false;
         self.git_panel_open = false;
         self.git_panel_mode = GitPanelMode::Browse;
         self.pending_branch_delete = None;
@@ -1063,6 +1186,7 @@ impl App {
     }
 
     pub fn toggle_settings_panel(&mut self) {
+        self.help_open = false;
         self.terminal_open = false;
         self.terminal_copy_mode = false;
         self.terminal_search_open = false;
@@ -1252,6 +1376,62 @@ impl App {
         self.repo_root.display().to_string()
     }
 
+    pub fn repo_name_display(&self) -> String {
+        self.repo_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.repo_root_display())
+    }
+
+    pub fn focus_ring_label(&self) -> &'static str {
+        match self.pane_focus {
+            PaneFocus::Diff => "Diff",
+            PaneFocus::Sidebar => "Sidebar",
+        }
+    }
+
+    pub fn diff_scroll_label(&self) -> String {
+        if self.diff_content_height == 0 {
+            return String::from("0/0");
+        }
+
+        let start = self
+            .diff_scroll
+            .saturating_add(1)
+            .min(self.diff_content_height);
+        let visible = self.layout.diff_viewport_height.max(1);
+        let end = (self.diff_scroll.saturating_add(visible)).min(self.diff_content_height);
+        format!("{}-{}/{}", start, end.max(start), self.diff_content_height)
+    }
+
+    pub fn active_diff_line_counts(&self) -> (usize, usize) {
+        let mut added = 0usize;
+        let mut removed = 0usize;
+
+        for row in &self.diff_rows {
+            if row
+                .new
+                .as_ref()
+                .map(|cell| cell.kind == CellKind::Added)
+                .unwrap_or(false)
+            {
+                added = added.saturating_add(1);
+            }
+
+            if row
+                .old
+                .as_ref()
+                .map(|cell| cell.kind == CellKind::Removed)
+                .unwrap_or(false)
+            {
+                removed = removed.saturating_add(1);
+            }
+        }
+
+        (added, removed)
+    }
+
     pub fn status_text(&self) -> &str {
         self.status.text.as_str()
     }
@@ -1264,14 +1444,10 @@ impl App {
         let (main_area, _) = layout::split_root(root);
         let (sidebar_area, diff_area) = layout::split_main_area(main_area, &self.settings);
 
-        let (unstaged_inner, staged_inner) = if let Some(area) = sidebar_area {
-            let (unstaged_area, staged_area) = layout::split_sidebar(area);
-            (
-                layout::bordered_inner(unstaged_area),
-                layout::bordered_inner(staged_area),
-            )
+        let tree_inner = if let Some(area) = sidebar_area {
+            layout::bordered_inner(area)
         } else {
-            (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0))
+            Rect::new(0, 0, 0, 0)
         };
 
         let (_, diff_body_area) = layout::split_diff(diff_area);
@@ -1294,8 +1470,9 @@ impl App {
         };
 
         self.layout = UiLayout {
-            unstaged_inner,
-            staged_inner,
+            unstaged_inner: Rect::new(0, 0, 0, 0),
+            staged_inner: Rect::new(0, 0, 0, 0),
+            tree_inner,
             diff_area: diff_body_area,
             diff_viewport_height,
         };
@@ -1329,6 +1506,7 @@ impl App {
     pub fn sync_scrolls(&mut self) {
         let unstaged_visible = self.layout.unstaged_inner.height as usize;
         let staged_visible = self.layout.staged_inner.height as usize;
+        let tree_visible = (self.layout.tree_inner.height as usize).saturating_sub(1);
 
         ensure_visible(
             self.unstaged_selected,
@@ -1341,6 +1519,12 @@ impl App {
             self.staged.len(),
             staged_visible,
             &mut self.staged_scroll,
+        );
+        ensure_visible(
+            self.tree_selected,
+            self.tree_files.len(),
+            tree_visible,
+            &mut self.tree_scroll,
         );
 
         let diff_visible = self.layout.diff_viewport_height;
@@ -1378,6 +1562,21 @@ impl App {
     }
 
     pub fn click(&mut self, column: u16, row: u16) -> Result<()> {
+        if contains(self.layout.tree_inner, column, row) {
+            self.pane_focus = PaneFocus::Sidebar;
+            self.focus = FocusSection::Unstaged;
+            let offset = (row - self.layout.tree_inner.y) as usize;
+            if offset == 0 {
+                return Ok(());
+            }
+            let idx = self.tree_scroll + offset.saturating_sub(1);
+            if idx < self.tree_files.len() {
+                self.tree_selected = Some(idx);
+            }
+            self.load_current_diff()?;
+            return Ok(());
+        }
+
         if contains(self.layout.unstaged_inner, column, row) {
             self.pane_focus = PaneFocus::Sidebar;
             self.focus = FocusSection::Unstaged;
@@ -1418,47 +1617,37 @@ impl App {
     }
 
     pub fn active_path(&self) -> Option<&str> {
-        match self.focus {
-            FocusSection::Unstaged => self.selected_unstaged().map(|entry| entry.path.as_str()),
-            FocusSection::Staged => self.selected_staged_path(),
-        }
+        self.selected_tree_path()
     }
 
     pub fn active_label(&self) -> &'static str {
-        match self.focus {
-            FocusSection::Unstaged => match self.selected_unstaged().map(|entry| entry.kind) {
-                Some(UnstagedKind::Untracked) => "Untracked",
-                _ => "Unstaged",
-            },
-            FocusSection::Staged => "Staged",
+        let Some(entry) = self.selected_tree_file() else {
+            return "Changes";
+        };
+
+        if entry.unstaged {
+            if entry.untracked {
+                "Untracked"
+            } else {
+                "Unstaged"
+            }
+        } else if entry.staged {
+            "Staged"
+        } else {
+            "Changes"
         }
     }
 
     fn selected_undo_target(&mut self) -> Option<PendingUndoConfirmation> {
-        match self.focus {
-            FocusSection::Unstaged => {
-                let Some(entry) = self.selected_unstaged().cloned() else {
-                    self.set_status_warn("No unstaged file selected");
-                    return None;
-                };
+        let Some(entry) = self.selected_tree_file().cloned() else {
+            self.set_status_warn("No file selected");
+            return None;
+        };
 
-                Some(PendingUndoConfirmation {
-                    path: entry.path,
-                    was_untracked: entry.kind == UnstagedKind::Untracked,
-                })
-            }
-            FocusSection::Staged => {
-                let Some(path) = self.selected_staged_path().map(ToOwned::to_owned) else {
-                    self.set_status_warn("No staged file selected");
-                    return None;
-                };
-
-                Some(PendingUndoConfirmation {
-                    path,
-                    was_untracked: false,
-                })
-            }
-        }
+        Some(PendingUndoConfirmation {
+            path: entry.path,
+            was_untracked: entry.untracked,
+        })
     }
 
     fn apply_undo_to_mainline(&mut self, target: PendingUndoConfirmation) -> Result<()> {
@@ -1536,7 +1725,7 @@ impl App {
     }
 
     fn has_sidebar(&self) -> bool {
-        self.layout.unstaged_inner.width > 0 || self.layout.staged_inner.width > 0
+        self.layout.tree_inner.width > 0
     }
 
     fn selected_unstaged(&self) -> Option<&FileEntry> {
@@ -1553,8 +1742,64 @@ impl App {
             .and_then(|idx| self.staged.get(idx).map(String::as_str))
     }
 
+    fn selected_tree_file(&self) -> Option<&TreeFileEntry> {
+        self.tree_selected.and_then(|idx| self.tree_files.get(idx))
+    }
+
+    fn selected_tree_path(&self) -> Option<&str> {
+        self.selected_tree_file().map(|entry| entry.path.as_str())
+    }
+
     fn selected_branch(&self) -> Option<&BranchEntry> {
         self.branch_selected.and_then(|idx| self.branches.get(idx))
+    }
+
+    fn restore_tree_selection(&mut self, preferred_path: Option<String>) {
+        use std::collections::BTreeMap;
+
+        let mut map: BTreeMap<String, TreeFileEntry> = BTreeMap::new();
+
+        for path in &self.staged {
+            let entry = map.entry(path.clone()).or_insert_with(|| TreeFileEntry {
+                path: path.clone(),
+                ..TreeFileEntry::default()
+            });
+            entry.staged = true;
+        }
+
+        for file in &self.unstaged {
+            let entry = map
+                .entry(file.path.clone())
+                .or_insert_with(|| TreeFileEntry {
+                    path: file.path.clone(),
+                    ..TreeFileEntry::default()
+                });
+            entry.unstaged = true;
+            entry.untracked = file.kind == UnstagedKind::Untracked;
+        }
+
+        self.tree_files = map.into_values().collect();
+
+        if self.tree_files.is_empty() {
+            self.tree_selected = None;
+            self.tree_scroll = 0;
+            return;
+        }
+
+        if let Some(path) = preferred_path
+            && let Some(idx) = self.tree_files.iter().position(|entry| entry.path == path)
+        {
+            self.tree_selected = Some(idx);
+            return;
+        }
+
+        if let Some(idx) = self.tree_selected
+            && idx < self.tree_files.len()
+        {
+            return;
+        }
+
+        self.tree_selected = Some(0);
     }
 
     fn restore_unstaged_selection(&mut self, preferred_path: Option<String>) {
@@ -1630,58 +1875,41 @@ impl App {
     }
 
     fn normalize_focus(&mut self) {
-        match self.focus {
-            FocusSection::Unstaged if self.unstaged.is_empty() && !self.staged.is_empty() => {
-                self.focus = FocusSection::Staged;
-            }
-            FocusSection::Staged if self.staged.is_empty() && !self.unstaged.is_empty() => {
-                self.focus = FocusSection::Unstaged;
-            }
-            _ => {}
-        }
-
-        if !self.unstaged.is_empty() && self.unstaged_selected.is_none() {
-            self.unstaged_selected = Some(0);
-        }
-        if !self.staged.is_empty() && self.staged_selected.is_none() {
-            self.staged_selected = Some(0);
+        if self.tree_files.is_empty() {
+            self.tree_selected = None;
+            self.tree_scroll = 0;
+        } else if self.tree_selected.is_none() {
+            self.tree_selected = Some(0);
         }
     }
 
     fn active_selection(&self) -> Option<(String, DiffMode)> {
-        match self.focus {
-            FocusSection::Unstaged => self.selected_unstaged().map(|entry| {
-                let mode = match entry.kind {
-                    UnstagedKind::Tracked => DiffMode::UnstagedTracked,
-                    UnstagedKind::Untracked => DiffMode::Untracked,
-                };
-                (entry.path.clone(), mode)
-            }),
-            FocusSection::Staged => self
-                .selected_staged_path()
-                .map(|path| (path.to_owned(), DiffMode::Staged)),
-        }
+        let entry = self.selected_tree_file()?;
+        let mode = if entry.unstaged {
+            if entry.untracked {
+                DiffMode::Untracked
+            } else {
+                DiffMode::UnstagedTracked
+            }
+        } else if entry.staged {
+            DiffMode::Staged
+        } else {
+            return None;
+        };
+
+        Some((entry.path.clone(), mode))
     }
 
     fn focus_len(&self) -> usize {
-        match self.focus {
-            FocusSection::Unstaged => self.unstaged.len(),
-            FocusSection::Staged => self.staged.len(),
-        }
+        self.tree_files.len()
     }
 
     fn focus_selected(&self) -> Option<usize> {
-        match self.focus {
-            FocusSection::Unstaged => self.unstaged_selected,
-            FocusSection::Staged => self.staged_selected,
-        }
+        self.tree_selected
     }
 
     fn set_focus_selected(&mut self, value: Option<usize>) {
-        match self.focus {
-            FocusSection::Unstaged => self.unstaged_selected = value,
-            FocusSection::Staged => self.staged_selected = value,
-        }
+        self.tree_selected = value;
     }
 }
 

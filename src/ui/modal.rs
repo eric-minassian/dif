@@ -271,7 +271,7 @@ pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette
                 Style::default().fg(rgb(palette.dim)),
             ),
             Line::styled(
-                format!("Esc or {} closes this panel", keymap::KEY_OPEN_GIT_PANEL),
+                format!("Esc/q/{} closes this panel", keymap::KEY_OPEN_GIT_PANEL),
                 Style::default().fg(rgb(palette.dim)),
             ),
         ],
@@ -304,7 +304,7 @@ pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette
                 Style::default().fg(rgb(palette.status_warn)),
             ),
             Line::styled(
-                "Press y to delete, n/Esc to cancel",
+                "Press Enter/y to delete, n/Esc to cancel",
                 Style::default().fg(rgb(palette.dim)),
             ),
         ],
@@ -316,6 +316,105 @@ pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette
             .fg(rgb(palette.text)),
     );
     frame.render_widget(footer, sections[2]);
+}
+
+pub(crate) fn render_help_modal(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
+    let popup = layout::help_popup(area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Help ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(rgb(palette.modal_border)))
+        .style(
+            Style::default()
+                .bg(rgb(palette.modal_bg))
+                .fg(rgb(palette.text)),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let branch = app.current_branch_name().unwrap_or("<detached>");
+    let lines = vec![
+        Line::styled(
+            format!(
+                "repo: {}  |  branch: {}  |  focus: {}",
+                app.repo_name_display(),
+                branch,
+                app.focus_ring_label()
+            ),
+            Style::default().fg(rgb(palette.dim)),
+        ),
+        Line::from(""),
+        Line::styled(
+            "MAIN",
+            Style::default()
+                .fg(rgb(palette.border_focus))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "Tab/Shift+Tab toggles between sidebar and diff",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::styled(
+            "j/k or Up/Down move selection or scroll diff",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::styled(
+            "h/l or Left/Right switch pane focus",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::styled(
+            "Enter/Space toggle stage state; s stage; u unstage; x undo",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::styled(
+            "Tree mode markers: left M staged (green), right M unstaged (red)",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::styled(
+            "Home/End jump to edge; PageUp/PageDown move by page",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::styled(
+            "g branches; c commit; : or ! terminal; o settings; r refresh",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::from(""),
+        Line::styled(
+            "GIT PANEL",
+            Style::default()
+                .fg(rgb(palette.border_focus))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "Enter switch branch; n (or a) create; d delete; c commit prompt",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::from(""),
+        Line::styled(
+            "TERMINAL",
+            Style::default()
+                .fg(rgb(palette.border_focus))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "Alt+c copy mode; Shift+Up/Down fast scroll; Esc/Ctrl+]/g/q/w close",
+            Style::default().fg(rgb(palette.text)),
+        ),
+        Line::from(""),
+        Line::styled(
+            "Close: Esc, q, ?, or F1",
+            Style::default().fg(rgb(palette.dim)),
+        ),
+    ];
+
+    let paragraph = Paragraph::new(Text::from(lines)).style(
+        Style::default()
+            .bg(rgb(palette.modal_bg))
+            .fg(rgb(palette.text)),
+    );
+    frame.render_widget(paragraph, inner);
 }
 
 fn commit_editor_lines(message: &str, cursor: usize, palette: &Palette) -> Vec<Line<'static>> {

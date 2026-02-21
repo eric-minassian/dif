@@ -22,21 +22,11 @@ pub fn render(frame: &mut Frame, app: &App, highlighter: &Highlighter) {
     let (main_area, footer_area) = layout::split_root(root);
     let (sidebar_area, diff_area) = layout::split_main_area(main_area, &app.settings);
 
-    let (unstaged_area, staged_area) = if let Some(area) = sidebar_area {
-        let (unstaged, staged) = layout::split_sidebar(area);
-        (Some(unstaged), Some(staged))
-    } else {
-        (None, None)
-    };
-
     let (diff_header_area, diff_body_area) = layout::split_diff(diff_area);
     let resolved_layout = app.resolved_diff_layout(diff_body_area.width);
 
-    if let Some(area) = unstaged_area {
-        sidebar::render_unstaged(frame, app, area, &palette);
-    }
-    if let Some(area) = staged_area {
-        sidebar::render_staged(frame, app, area, &palette);
+    if let Some(area) = sidebar_area {
+        sidebar::render_tree(frame, app, area, &palette);
     }
 
     diff::render_diff_header(
@@ -66,6 +56,10 @@ pub fn render(frame: &mut Frame, app: &App, highlighter: &Highlighter) {
         modal::render_git_modal(frame, app, root, &palette);
     } else if app.settings_open {
         modal::render_settings_modal(frame, app, root, &palette);
+    }
+
+    if app.help_open {
+        modal::render_help_modal(frame, app, root, &palette);
     }
 }
 
@@ -104,10 +98,17 @@ fn render_footer(
 }
 
 fn footer_hint_variants(app: &App) -> Vec<String> {
+    if app.help_open {
+        return vec![
+            String::from("help: Esc/q/?/F1 close"),
+            String::from("main: Tab pane  Enter toggle  q quit"),
+        ];
+    }
+
     if app.has_pending_undo_confirmation() {
         return vec![
             keymap::footer_hint_pending_undo().to_owned(),
-            String::from("undo: y confirm  n/Esc cancel"),
+            String::from("undo: Enter/y confirm  n/Esc cancel"),
         ];
     }
 
@@ -128,7 +129,7 @@ fn footer_hint_variants(app: &App) -> Vec<String> {
     if app.terminal_open {
         return vec![
             keymap::footer_hint_terminal(),
-            String::from("terminal: Alt+c copy mode  Ctrl+]/g/q close"),
+            String::from("terminal: Alt+c copy mode  Esc/Ctrl+]/g/q/w close"),
         ];
     }
 
@@ -142,20 +143,20 @@ fn footer_hint_variants(app: &App) -> Vec<String> {
 
         return vec![
             keymap::footer_hint_git_panel(),
-            String::from("git: Enter switch  a new  d delete  c commit  Esc close"),
+            String::from("git: Enter switch  n new  d delete  c commit  Esc close"),
         ];
     }
 
     if app.settings_open {
         return vec![
             keymap::footer_hint_settings().to_owned(),
-            String::from("settings: jk select  hl change  Esc close"),
+            String::from("settings: jk select  hl change  Esc/q close"),
         ];
     }
 
     vec![
-        keymap::footer_hint_main(),
-        String::from("s stage  u unstage  g branches  c commit  : shell  q quit"),
+        String::from("Tab/h/l pane  j/k move  Enter toggle  PgUp/PgDn/Home/End navigate"),
+        String::from("s stage  u unstage  x undo  g branches  : terminal  ? help  q quit"),
     ]
 }
 

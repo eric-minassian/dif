@@ -11,9 +11,10 @@ pub const KEY_OPEN_GIT_PANEL: char = 'g';
 pub const KEY_OPEN_COMMIT: char = 'c';
 pub const KEY_OPEN_TERMINAL_PRIMARY: char = ':';
 pub const KEY_OPEN_TERMINAL_ALT: char = '!';
+pub const KEY_TOGGLE_HELP: char = '?';
 pub const KEY_REFRESH: char = 'r';
 
-pub const KEY_GIT_CREATE_BRANCH: char = 'a';
+pub const KEY_GIT_CREATE_BRANCH: char = 'n';
 pub const KEY_GIT_SWITCH_BRANCH: char = 's';
 pub const KEY_GIT_DELETE_BRANCH: char = 'd';
 pub const KEY_GIT_COMMIT: char = KEY_OPEN_COMMIT;
@@ -28,11 +29,11 @@ pub const KEY_TERMINAL_SEARCH_NEXT: char = 'n';
 pub const KEY_SETTINGS_CLOSE: char = KEY_OPEN_SETTINGS;
 
 pub fn terminal_close_hint() -> &'static str {
-    "Ctrl+], Ctrl+g, or Ctrl+q"
+    "Esc, Ctrl+], Ctrl+g, Ctrl+q, or Ctrl+w"
 }
 
 pub fn footer_hint_pending_undo() -> &'static str {
-    "confirm undo: y apply to mainline, n/Esc cancel"
+    "confirm undo: Enter/y apply to mainline, n/Esc cancel"
 }
 
 pub fn footer_hint_terminal_search() -> &'static str {
@@ -59,12 +60,12 @@ pub fn footer_hint_terminal() -> String {
 }
 
 pub fn footer_hint_settings() -> &'static str {
-    "settings: j/k select, h/l change, Esc close"
+    "settings: j/k select, h/l change, Esc/o close"
 }
 
 pub fn footer_hint_main() -> String {
     format!(
-        "Tab list  Left/Right pane  Up/Down move-or-scroll  {} stage  {} unstage  {} undo->mainline  {} branches  {} commit  {} terminal  {} settings  {} quit",
+        "Tab pane  h/l pane  j/k move-or-scroll  Enter toggle-stage  {} stage  {} unstage  {} undo  {} branches  {} commit  {} terminal  {} settings  {} help  {} quit",
         KEY_STAGE,
         KEY_UNSTAGE,
         KEY_UNDO_MAINLINE,
@@ -72,6 +73,7 @@ pub fn footer_hint_main() -> String {
         KEY_OPEN_COMMIT,
         KEY_OPEN_TERMINAL_PRIMARY,
         KEY_OPEN_SETTINGS,
+        KEY_TOGGLE_HELP,
         KEY_QUIT,
     )
 }
@@ -92,8 +94,8 @@ pub fn terminal_modal_copy_hint() -> &'static str {
 mod tests {
     use super::{
         KEY_OPEN_GIT_PANEL, KEY_OPEN_SETTINGS, KEY_OPEN_TERMINAL_PRIMARY, KEY_QUIT, KEY_STAGE,
-        KEY_TERMINAL_COPY_MODE, KEY_UNDO_MAINLINE, footer_hint_main, footer_hint_terminal,
-        terminal_modal_interactive_hint,
+        KEY_TERMINAL_COPY_MODE, KEY_TOGGLE_HELP, KEY_UNDO_MAINLINE, footer_hint_main,
+        footer_hint_terminal, terminal_modal_interactive_hint,
     };
 
     #[test]
@@ -104,6 +106,7 @@ mod tests {
         assert!(hint.contains(KEY_OPEN_GIT_PANEL));
         assert!(hint.contains(KEY_OPEN_TERMINAL_PRIMARY));
         assert!(hint.contains(KEY_OPEN_SETTINGS));
+        assert!(hint.contains(KEY_TOGGLE_HELP));
         assert!(hint.contains(KEY_QUIT));
     }
 

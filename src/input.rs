@@ -8,12 +8,16 @@ use crate::keymap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainKeyAction {
-    SwitchFocus,
+    CycleFocusForward,
+    CycleFocusBackward,
     MoveUp,
     MoveDown,
     TogglePaneFocus,
     PageUp,
     PageDown,
+    JumpTop,
+    JumpBottom,
+    StageToggle,
     Stage,
     Unstage,
     UndoToMainline,
@@ -40,6 +44,23 @@ enum SettingsKeyAction {
 const FAST_TERMINAL_SCROLL_STEP: isize = 12;
 
 pub fn handle_event(app: &mut App, event: Event) -> bool {
+    if let Event::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && wants_help_toggle(app, *key)
+    {
+        app.toggle_help_panel();
+        return true;
+    }
+
+    if app.help_open {
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+        {
+            handle_help_key(app, key.code);
+        }
+        return true;
+    }
+
     if app.has_pending_undo_confirmation() {
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
@@ -111,12 +132,18 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
 
 fn map_main_key(code: KeyCode) -> Option<MainKeyAction> {
     match code {
-        KeyCode::Tab | KeyCode::BackTab => Some(MainKeyAction::SwitchFocus),
+        KeyCode::Tab => Some(MainKeyAction::CycleFocusForward),
+        KeyCode::BackTab => Some(MainKeyAction::CycleFocusBackward),
         KeyCode::Up | KeyCode::Char('k') => Some(MainKeyAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(MainKeyAction::MoveDown),
-        KeyCode::Left | KeyCode::Right => Some(MainKeyAction::TogglePaneFocus),
+        KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+            Some(MainKeyAction::TogglePaneFocus)
+        }
         KeyCode::PageUp => Some(MainKeyAction::PageUp),
         KeyCode::PageDown => Some(MainKeyAction::PageDown),
+        KeyCode::Home => Some(MainKeyAction::JumpTop),
+        KeyCode::End => Some(MainKeyAction::JumpBottom),
+        KeyCode::Enter | KeyCode::Char(' ') => Some(MainKeyAction::StageToggle),
         KeyCode::Char(keymap::KEY_STAGE) => Some(MainKeyAction::Stage),
         KeyCode::Char(keymap::KEY_UNSTAGE) => Some(MainKeyAction::Unstage),
         KeyCode::Char(keymap::KEY_UNDO_MAINLINE) => Some(MainKeyAction::UndoToMainline),
@@ -136,7 +163,8 @@ fn map_main_key(code: KeyCode) -> Option<MainKeyAction> {
 
 fn run_main_action(app: &mut App, action: MainKeyAction) {
     match action {
-        MainKeyAction::SwitchFocus => run_action_with(app, App::switch_focus),
+        MainKeyAction::CycleFocusForward => run_action_with(app, |app| app.cycle_focus_ring(1)),
+        MainKeyAction::CycleFocusBackward => run_action_with(app, |app| app.cycle_focus_ring(-1)),
         MainKeyAction::MoveUp => {
             if app.is_diff_focused() {
                 app.scroll_diff(-1);
@@ -152,8 +180,25 @@ fn run_main_action(app: &mut App, action: MainKeyAction) {
             }
         }
         MainKeyAction::TogglePaneFocus => app.toggle_pane_focus(),
-        MainKeyAction::PageUp => app.scroll_diff(-10),
-        MainKeyAction::PageDown => app.scroll_diff(10),
+        MainKeyAction::PageUp => {
+            if app.is_diff_focused() {
+                app.scroll_diff_page(-1);
+            } else {
+                run_action_with(app, |app| app.move_selection_page(-1));
+            }
+        }
+        MainKeyAction::PageDown => {
+            if app.is_diff_focused() {
+                app.scroll_diff_page(1);
+            } else {
+                run_action_with(app, |app| app.move_selection_page(1));
+            }
+        }
+        MainKeyAction::JumpTop => run_action_with(app, |app| app.jump_focused_area_to_edge(false)),
+        MainKeyAction::JumpBottom => {
+            run_action_with(app, |app| app.jump_focused_area_to_edge(true))
+        }
+        MainKeyAction::StageToggle => run_action_with(app, App::toggle_stage_state),
         MainKeyAction::Stage => run_action_with(app, App::stage_selected),
         MainKeyAction::Unstage => run_action_with(app, App::unstage_selected),
         MainKeyAction::UndoToMainline => run_action_with(app, App::undo_selected_to_mainline),
@@ -180,13 +225,17 @@ fn handle_git_panel_key(app: &mut App, key: KeyEvent) {
 
 fn handle_git_panel_browse_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char(keymap::KEY_OPEN_GIT_PANEL) => app.close_git_panel(),
+        KeyCode::Esc | KeyCode::Char(keymap::KEY_OPEN_GIT_PANEL) | KeyCode::Char('q') => {
+            app.close_git_panel()
+        }
         KeyCode::Up | KeyCode::Char('k') => app.move_branch_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_branch_selection(1),
         KeyCode::Enter | KeyCode::Char(keymap::KEY_GIT_SWITCH_BRANCH) => {
             run_action_with(app, App::switch_to_selected_branch)
         }
-        KeyCode::Char(keymap::KEY_GIT_CREATE_BRANCH) => app.open_branch_create_prompt(),
+        KeyCode::Char(keymap::KEY_GIT_CREATE_BRANCH) | KeyCode::Char('a') => {
+            app.open_branch_create_prompt()
+        }
         KeyCode::Char(keymap::KEY_GIT_DELETE_BRANCH) => app.request_delete_selected_branch(),
         KeyCode::Char(keymap::KEY_GIT_COMMIT) => run_action_with(app, App::open_commit_prompt),
         KeyCode::Char(keymap::KEY_REFRESH) => run_action_with(app, App::refresh_with_message),
@@ -240,7 +289,7 @@ fn handle_git_panel_commit_key(app: &mut App, key: KeyEvent) {
 
 fn handle_git_panel_delete_confirm_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             run_action_with(app, App::confirm_delete_selected_branch)
         }
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.cancel_git_prompt(),
@@ -270,7 +319,7 @@ fn normalize_newlines(input: &str) -> String {
 
 fn handle_pending_undo_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             let result = app.confirm_pending_undo_to_mainline();
             run_action(app, result);
         }
@@ -299,9 +348,10 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
 
 fn map_settings_key(code: KeyCode) -> Option<SettingsKeyAction> {
     match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char(keymap::KEY_SETTINGS_CLOSE) => {
-            Some(SettingsKeyAction::Close)
-        }
+        KeyCode::Esc
+        | KeyCode::Enter
+        | KeyCode::Char(keymap::KEY_SETTINGS_CLOSE)
+        | KeyCode::Char('q') => Some(SettingsKeyAction::Close),
         KeyCode::Up | KeyCode::Char('k') => Some(SettingsKeyAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(SettingsKeyAction::MoveDown),
         KeyCode::Left | KeyCode::Char('h') => Some(SettingsKeyAction::AdjustLeft),
@@ -416,7 +466,55 @@ fn handle_terminal_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn wants_help_toggle(app: &App, key: KeyEvent) -> bool {
+    if key.code == KeyCode::F(1) {
+        return true;
+    }
+
+    if key.code != KeyCode::Char(keymap::KEY_TOGGLE_HELP) {
+        return false;
+    }
+
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+
+    app.help_open || can_toggle_help_with_question_mark(app)
+}
+
+fn can_toggle_help_with_question_mark(app: &App) -> bool {
+    if app.terminal_open {
+        return app.terminal_copy_mode && !app.terminal_search_open;
+    }
+
+    if app.git_panel_open {
+        return matches!(
+            app.git_panel_mode,
+            GitPanelMode::Browse | GitPanelMode::ConfirmDeleteBranch
+        );
+    }
+
+    true
+}
+
+fn handle_help_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc
+        | KeyCode::F(1)
+        | KeyCode::Char(keymap::KEY_TOGGLE_HELP)
+        | KeyCode::Char('q') => app.close_help_panel(),
+        _ => {}
+    }
+}
+
 fn is_terminal_close_chord(key: KeyEvent) -> bool {
+    if key.code == KeyCode::Esc {
+        return true;
+    }
+
     if key.code == KeyCode::Char('\u{1d}') {
         return true;
     }
@@ -424,7 +522,11 @@ fn is_terminal_close_chord(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             key.code,
-            KeyCode::Char(']') | KeyCode::Char('g') | KeyCode::Char('5') | KeyCode::Char('q')
+            KeyCode::Char(']')
+                | KeyCode::Char('g')
+                | KeyCode::Char('5')
+                | KeyCode::Char('q')
+                | KeyCode::Char('w')
         )
 }
 
@@ -451,6 +553,18 @@ mod tests {
 
     #[test]
     fn maps_main_keybindings_to_actions() {
+        assert_eq!(
+            map_main_key(KeyCode::Tab),
+            Some(MainKeyAction::CycleFocusForward)
+        );
+        assert_eq!(
+            map_main_key(KeyCode::BackTab),
+            Some(MainKeyAction::CycleFocusBackward)
+        );
+        assert_eq!(
+            map_main_key(KeyCode::Enter),
+            Some(MainKeyAction::StageToggle)
+        );
         assert_eq!(
             map_main_key(KeyCode::Char(keymap::KEY_STAGE)),
             Some(MainKeyAction::Stage)
