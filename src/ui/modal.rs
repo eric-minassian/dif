@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use vt100::Color as VtColor;
 
-use crate::app::App;
+use crate::app::{App, GitPanelMode};
 use crate::keymap;
 use crate::layout;
 use crate::terminal::{TerminalCellStyle, TerminalStyledRow};
@@ -143,6 +143,145 @@ pub(crate) fn render_settings_modal(frame: &mut Frame, app: &App, area: Rect, pa
     let paragraph =
         Paragraph::new(Text::from(lines)).style(Style::default().bg(rgb(palette.modal_bg)));
     frame.render_widget(paragraph, inner);
+}
+
+pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette: &Palette) {
+    let popup = layout::git_popup(area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Git ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(rgb(palette.modal_border)))
+        .style(
+            Style::default()
+                .bg(rgb(palette.modal_bg))
+                .fg(rgb(palette.text)),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let current_branch = app.current_branch_name().unwrap_or("<detached>");
+    let selected_branch = app.selected_branch_name().unwrap_or("-");
+    let header = Paragraph::new(format!(
+        "current: {}  |  selected: {}  |  local branches: {}  |  staged: {}",
+        current_branch,
+        selected_branch,
+        app.branches.len(),
+        app.staged.len(),
+    ))
+    .style(Style::default().fg(rgb(palette.dim)));
+    frame.render_widget(header, sections[0]);
+
+    let mut branch_lines = Vec::new();
+    if app.branches.is_empty() {
+        branch_lines.push(Line::styled(
+            "(no local branches)",
+            Style::default().fg(rgb(palette.dim)),
+        ));
+    } else {
+        for (idx, branch) in app.branches.iter().enumerate() {
+            let prefix = if app.branch_selected == Some(idx) {
+                ">"
+            } else {
+                " "
+            };
+            let marker = if branch.current { "*" } else { " " };
+            let style = if app.branch_selected == Some(idx) {
+                Style::default()
+                    .fg(rgb(palette.text))
+                    .bg(rgb(palette.modal_selected_bg))
+                    .add_modifier(Modifier::BOLD)
+            } else if branch.current {
+                Style::default().fg(rgb(palette.border_focus))
+            } else {
+                Style::default().fg(rgb(palette.text))
+            };
+
+            branch_lines.push(Line::styled(
+                format!("{prefix} {marker} {}", branch.name),
+                style,
+            ));
+        }
+    }
+
+    let branches = Paragraph::new(Text::from(branch_lines))
+        .block(
+            Block::default()
+                .title(" Branches ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(rgb(palette.modal_border))),
+        )
+        .style(Style::default().bg(rgb(palette.modal_bg)));
+    frame.render_widget(branches, sections[1]);
+
+    let footer_lines = match app.git_panel_mode {
+        GitPanelMode::Browse => vec![
+            Line::styled(
+                format!(
+                    "{} new branch  Enter/{} switch  {} delete  {} commit",
+                    keymap::KEY_GIT_CREATE_BRANCH,
+                    keymap::KEY_GIT_SWITCH_BRANCH,
+                    keymap::KEY_GIT_DELETE_BRANCH,
+                    keymap::KEY_GIT_COMMIT,
+                ),
+                Style::default().fg(rgb(palette.dim)),
+            ),
+            Line::styled(
+                format!("Esc or {} closes this panel", keymap::KEY_OPEN_GIT_PANEL),
+                Style::default().fg(rgb(palette.dim)),
+            ),
+        ],
+        GitPanelMode::CreateBranch => vec![
+            Line::styled(
+                format!("new branch: {}_", app.git_branch_input),
+                Style::default().fg(rgb(palette.text)),
+            ),
+            Line::styled(
+                "Enter creates + switches, Esc cancels",
+                Style::default().fg(rgb(palette.dim)),
+            ),
+        ],
+        GitPanelMode::CommitMessage => vec![
+            Line::styled(
+                format!("commit message: {}_", app.git_commit_input),
+                Style::default().fg(rgb(palette.text)),
+            ),
+            Line::styled(
+                "Enter commits staged files, Esc cancels",
+                Style::default().fg(rgb(palette.dim)),
+            ),
+        ],
+        GitPanelMode::ConfirmDeleteBranch => vec![
+            Line::styled(
+                format!(
+                    "delete branch `{}`?",
+                    app.pending_branch_delete_name().unwrap_or("<unknown>")
+                ),
+                Style::default().fg(rgb(palette.status_warn)),
+            ),
+            Line::styled(
+                "Press y to delete, n/Esc to cancel",
+                Style::default().fg(rgb(palette.dim)),
+            ),
+        ],
+    };
+
+    let footer = Paragraph::new(Text::from(footer_lines)).style(
+        Style::default()
+            .bg(rgb(palette.modal_bg))
+            .fg(rgb(palette.text)),
+    );
+    frame.render_widget(footer, sections[2]);
 }
 
 fn terminal_row_to_line(

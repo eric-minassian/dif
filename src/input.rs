@@ -3,7 +3,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 
-use crate::app::App;
+use crate::app::{App, GitPanelMode};
 use crate::keymap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,8 @@ enum MainKeyAction {
     SidebarNarrow,
     SidebarWide,
     ToggleSettings,
+    ToggleGitPanel,
+    OpenCommitPrompt,
     OpenTerminal,
     Refresh,
 }
@@ -56,6 +58,11 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
                 return false;
             }
 
+            if app.git_panel_open {
+                handle_git_panel_key(app, key);
+                return true;
+            }
+
             if app.settings_open {
                 handle_settings_key(app, key.code);
                 return true;
@@ -75,6 +82,7 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
                 run_action(app, result);
             }
         }
+        Event::Paste(text) if app.git_panel_open => handle_git_panel_paste(app, &text),
         Event::Mouse(mouse) if app.terminal_open => match mouse.kind {
             MouseEventKind::ScrollUp => app.scroll_terminal(3),
             MouseEventKind::ScrollDown => app.scroll_terminal(-3),
@@ -115,6 +123,8 @@ fn map_main_key(code: KeyCode) -> Option<MainKeyAction> {
         KeyCode::Char(keymap::KEY_SIDEBAR_NARROW) => Some(MainKeyAction::SidebarNarrow),
         KeyCode::Char(keymap::KEY_SIDEBAR_WIDE) => Some(MainKeyAction::SidebarWide),
         KeyCode::Char(keymap::KEY_OPEN_SETTINGS) => Some(MainKeyAction::ToggleSettings),
+        KeyCode::Char(keymap::KEY_OPEN_GIT_PANEL) => Some(MainKeyAction::ToggleGitPanel),
+        KeyCode::Char(keymap::KEY_OPEN_COMMIT) => Some(MainKeyAction::OpenCommitPrompt),
         KeyCode::Char(keymap::KEY_OPEN_TERMINAL_PRIMARY)
         | KeyCode::Char(keymap::KEY_OPEN_TERMINAL_ALT) => Some(MainKeyAction::OpenTerminal),
         KeyCode::Char(keymap::KEY_REFRESH) => Some(MainKeyAction::Refresh),
@@ -150,8 +160,95 @@ fn run_main_action(app: &mut App, action: MainKeyAction) {
         MainKeyAction::SidebarNarrow => run_action_with(app, |app| app.resize_sidebar(-1)),
         MainKeyAction::SidebarWide => run_action_with(app, |app| app.resize_sidebar(1)),
         MainKeyAction::ToggleSettings => app.toggle_settings_panel(),
+        MainKeyAction::ToggleGitPanel => run_action_with(app, App::toggle_git_panel),
+        MainKeyAction::OpenCommitPrompt => run_action_with(app, App::open_commit_prompt),
         MainKeyAction::OpenTerminal => run_action_with(app, App::open_terminal),
         MainKeyAction::Refresh => run_action_with(app, App::refresh_with_message),
+    }
+}
+
+fn handle_git_panel_key(app: &mut App, key: KeyEvent) {
+    match app.git_panel_mode {
+        GitPanelMode::Browse => handle_git_panel_browse_key(app, key),
+        GitPanelMode::CreateBranch => handle_git_panel_create_branch_key(app, key),
+        GitPanelMode::CommitMessage => handle_git_panel_commit_key(app, key),
+        GitPanelMode::ConfirmDeleteBranch => handle_git_panel_delete_confirm_key(app, key.code),
+    }
+}
+
+fn handle_git_panel_browse_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char(keymap::KEY_OPEN_GIT_PANEL) => app.close_git_panel(),
+        KeyCode::Up | KeyCode::Char('k') => app.move_branch_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_branch_selection(1),
+        KeyCode::Enter | KeyCode::Char(keymap::KEY_GIT_SWITCH_BRANCH) => {
+            run_action_with(app, App::switch_to_selected_branch)
+        }
+        KeyCode::Char(keymap::KEY_GIT_CREATE_BRANCH) => app.open_branch_create_prompt(),
+        KeyCode::Char(keymap::KEY_GIT_DELETE_BRANCH) => app.request_delete_selected_branch(),
+        KeyCode::Char(keymap::KEY_GIT_COMMIT) => run_action_with(app, App::open_commit_prompt),
+        KeyCode::Char(keymap::KEY_REFRESH) => run_action_with(app, App::refresh_with_message),
+        _ => {}
+    }
+}
+
+fn handle_git_panel_create_branch_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_git_prompt(),
+        KeyCode::Enter => run_action_with(app, App::submit_new_branch),
+        KeyCode::Backspace => app.git_branch_input_backspace(),
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.git_branch_input_append(ch);
+        }
+        _ => {}
+    }
+}
+
+fn handle_git_panel_commit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_git_prompt(),
+        KeyCode::Enter => run_action_with(app, App::submit_commit),
+        KeyCode::Backspace => app.git_commit_input_backspace(),
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.git_commit_input_append(ch);
+        }
+        _ => {}
+    }
+}
+
+fn handle_git_panel_delete_confirm_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            run_action_with(app, App::confirm_delete_selected_branch)
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => app.cancel_git_prompt(),
+        _ => {}
+    }
+}
+
+fn handle_git_panel_paste(app: &mut App, text: &str) {
+    match app.git_panel_mode {
+        GitPanelMode::CreateBranch => {
+            for ch in text.chars() {
+                if ch != '\n' && ch != '\r' {
+                    app.git_branch_input_append(ch);
+                }
+            }
+        }
+        GitPanelMode::CommitMessage => {
+            for ch in text.chars() {
+                if ch != '\n' && ch != '\r' {
+                    app.git_commit_input_append(ch);
+                }
+            }
+        }
+        GitPanelMode::Browse | GitPanelMode::ConfirmDeleteBranch => {}
     }
 }
 
@@ -321,6 +418,14 @@ mod tests {
         assert_eq!(
             map_main_key(KeyCode::Char(keymap::KEY_OPEN_TERMINAL_PRIMARY)),
             Some(MainKeyAction::OpenTerminal)
+        );
+        assert_eq!(
+            map_main_key(KeyCode::Char(keymap::KEY_OPEN_GIT_PANEL)),
+            Some(MainKeyAction::ToggleGitPanel)
+        );
+        assert_eq!(
+            map_main_key(KeyCode::Char(keymap::KEY_OPEN_COMMIT)),
+            Some(MainKeyAction::OpenCommitPrompt)
         );
         assert_eq!(map_main_key(KeyCode::F(5)), None);
     }

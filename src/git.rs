@@ -15,6 +15,12 @@ pub struct FileEntry {
     pub kind: UnstagedKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchEntry {
+    pub name: String,
+    pub current: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RepoStatus {
     pub unstaged: Vec<FileEntry>,
@@ -53,6 +59,23 @@ pub fn status(repo_root: &Path) -> Result<RepoStatus> {
     }
 
     Ok(parse_porcelain_status(&output.stdout))
+}
+
+pub fn list_local_branches(repo_root: &Path) -> Result<Vec<BranchEntry>> {
+    let output = run_git(
+        repo_root,
+        &[
+            "branch",
+            "--list",
+            "--format=%(HEAD)\t%(refname:short)",
+            "--sort=refname",
+        ],
+    )?;
+    if !output.status.success() {
+        bail!(git_error("list local branches", &output));
+    }
+
+    Ok(parse_branch_listing(&output.stdout))
 }
 
 pub fn diff_for_file(repo_root: &Path, path: &str, mode: DiffMode) -> Result<String> {
@@ -110,6 +133,82 @@ pub fn unstage_file(repo_root: &Path, path: &str) -> Result<()> {
 
     if !output.status.success() {
         bail!(git_error(&format!("unstage `{path}`"), &output));
+    }
+
+    Ok(())
+}
+
+pub fn create_branch(repo_root: &Path, name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("branch name cannot be empty");
+    }
+
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["switch", "-c"])
+        .arg(name)
+        .output()
+        .with_context(|| format!("failed to create branch `{name}`"))?;
+
+    if !output.status.success() {
+        bail!(git_error(&format!("create branch `{name}`"), &output));
+    }
+
+    Ok(())
+}
+
+pub fn switch_branch(repo_root: &Path, name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("branch name cannot be empty");
+    }
+
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["switch"])
+        .arg(name)
+        .output()
+        .with_context(|| format!("failed to switch to branch `{name}`"))?;
+
+    if !output.status.success() {
+        bail!(git_error(&format!("switch to branch `{name}`"), &output));
+    }
+
+    Ok(())
+}
+
+pub fn delete_branch(repo_root: &Path, name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("branch name cannot be empty");
+    }
+
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["branch", "-d", "--"])
+        .arg(name)
+        .output()
+        .with_context(|| format!("failed to delete branch `{name}`"))?;
+
+    if !output.status.success() {
+        bail!(git_error(&format!("delete branch `{name}`"), &output));
+    }
+
+    Ok(())
+}
+
+pub fn commit(repo_root: &Path, message: &str) -> Result<()> {
+    if message.trim().is_empty() {
+        bail!("commit message cannot be empty");
+    }
+
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["commit", "-m"])
+        .arg(message)
+        .output()
+        .with_context(|| format!("failed to create commit `{message}`"))?;
+
+    if !output.status.success() {
+        bail!(git_error("create commit", &output));
     }
 
     Ok(())
@@ -213,6 +312,39 @@ fn parse_nul_terminated(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn parse_branch_listing(raw: &[u8]) -> Vec<BranchEntry> {
+    let mut branches = Vec::new();
+    let text = String::from_utf8_lossy(raw);
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (current, name) = if let Some((head_marker, branch_name)) = line.split_once('\t') {
+            (head_marker.trim() == "*", branch_name.trim())
+        } else if let Some(branch_name) = line.strip_prefix("* ") {
+            (true, branch_name.trim())
+        } else if let Some(branch_name) = line.strip_prefix("  ") {
+            (false, branch_name.trim())
+        } else {
+            (false, line.trim())
+        };
+
+        if name.is_empty() {
+            continue;
+        }
+
+        branches.push(BranchEntry {
+            name: name.to_owned(),
+            current,
+        });
+    }
+
+    branches
+}
+
 fn parse_porcelain_status(raw: &[u8]) -> RepoStatus {
     let records = parse_nul_terminated(raw);
     let mut staged = Vec::new();
@@ -290,7 +422,7 @@ fn git_error(action: &str, output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{UnstagedKind, parse_porcelain_status};
+    use super::{UnstagedKind, parse_branch_listing, parse_porcelain_status};
 
     #[test]
     fn parses_staged_unstaged_and_untracked_entries() {
@@ -314,5 +446,29 @@ mod tests {
 
         assert_eq!(status.staged, vec!["new-name.txt"]);
         assert!(status.unstaged.is_empty());
+    }
+
+    #[test]
+    fn parses_branch_listing_with_head_markers() {
+        let raw = b"*\tmain\n \tfeature/login\n";
+        let branches = parse_branch_listing(raw);
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].current);
+        assert_eq!(branches[1].name, "feature/login");
+        assert!(!branches[1].current);
+    }
+
+    #[test]
+    fn parses_branch_listing_default_style_fallback() {
+        let raw = b"* main\n  hotfix\n";
+        let branches = parse_branch_listing(raw);
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].current);
+        assert_eq!(branches[1].name, "hotfix");
+        assert!(!branches[1].current);
     }
 }

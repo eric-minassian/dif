@@ -61,6 +61,8 @@ pub fn render(frame: &mut Frame, app: &App, highlighter: &Highlighter) {
 
     if app.terminal_open {
         modal::render_terminal_modal(frame, app, root, &palette);
+    } else if app.git_panel_open {
+        modal::render_git_modal(frame, app, root, &palette);
     } else if app.settings_open {
         modal::render_settings_modal(frame, app, root, &palette);
     }
@@ -80,6 +82,8 @@ fn render_footer(
         keymap::footer_hint_terminal_copy().to_owned()
     } else if app.terminal_open {
         keymap::footer_hint_terminal()
+    } else if app.git_panel_open {
+        keymap::footer_hint_git_panel()
     } else if app.settings_open {
         keymap::footer_hint_settings().to_owned()
     } else {

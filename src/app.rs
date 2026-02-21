@@ -6,7 +6,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 
 use crate::diff::{DiffRow, parse_unified_diff, unified_line_count};
-use crate::git::{self, DiffMode, FileEntry, UnstagedKind};
+use crate::git::{self, BranchEntry, DiffMode, FileEntry, UnstagedKind};
 use crate::layout;
 use crate::settings::{
     self, AUTO_SPLIT_MIN_WIDTH_MAX, AUTO_SPLIT_MIN_WIDTH_MIN, AppSettings, DiffViewMode,
@@ -34,6 +34,14 @@ pub enum FocusSection {
 pub enum PaneFocus {
     Sidebar,
     Diff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitPanelMode {
+    Browse,
+    CreateBranch,
+    CommitMessage,
+    ConfirmDeleteBranch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +92,12 @@ pub struct App {
     pub settings: AppSettings,
     pub settings_open: bool,
     pub settings_selected: usize,
+    pub git_panel_open: bool,
+    pub git_panel_mode: GitPanelMode,
+    pub branches: Vec<BranchEntry>,
+    pub branch_selected: Option<usize>,
+    pub git_branch_input: String,
+    pub git_commit_input: String,
     pub terminal_open: bool,
     pub terminal_scrollback: usize,
     pub terminal_copy_mode: bool,
@@ -110,6 +124,7 @@ pub struct App {
     pub status: StatusMessage,
     pub layout: UiLayout,
     pending_undo_confirmation: Option<PendingUndoConfirmation>,
+    pending_branch_delete: Option<String>,
 }
 
 impl App {
@@ -130,6 +145,12 @@ impl App {
             settings,
             settings_open: false,
             settings_selected: 0,
+            git_panel_open: false,
+            git_panel_mode: GitPanelMode::Browse,
+            branches: Vec::new(),
+            branch_selected: None,
+            git_branch_input: String::new(),
+            git_commit_input: String::new(),
             terminal_open: false,
             terminal_scrollback: 0,
             terminal_copy_mode: false,
@@ -156,6 +177,7 @@ impl App {
             status,
             layout: UiLayout::default(),
             pending_undo_confirmation: None,
+            pending_branch_delete: None,
         };
 
         app.refresh()?;
@@ -172,15 +194,18 @@ impl App {
     pub fn refresh(&mut self) -> Result<()> {
         let previous_unstaged = self.selected_unstaged_path().map(ToOwned::to_owned);
         let previous_staged = self.selected_staged_path().map(ToOwned::to_owned);
+        let previous_branch = self.selected_branch_name().map(ToOwned::to_owned);
         let previous_active = self.active_selection();
         let previous_diff_scroll = self.diff_scroll;
 
         let status = git::status(&self.repo_root)?;
         self.unstaged = status.unstaged;
         self.staged = status.staged;
+        self.branches = git::list_local_branches(&self.repo_root)?;
 
         self.restore_unstaged_selection(previous_unstaged);
         self.restore_staged_selection(previous_staged);
+        self.restore_branch_selection(previous_branch);
         self.normalize_focus();
 
         let preserve_diff_scroll = self.active_selection() == previous_active;
@@ -224,6 +249,7 @@ impl App {
 
         if !self.terminal_open
             && !self.settings_open
+            && !self.git_panel_open
             && let Err(error) = self.auto_refresh_if_due()
         {
             self.set_status_error(error);
@@ -413,8 +439,233 @@ impl App {
         Ok(())
     }
 
+    pub fn toggle_git_panel(&mut self) -> Result<()> {
+        if self.git_panel_open {
+            self.close_git_panel();
+            return Ok(());
+        }
+
+        self.settings_open = false;
+        self.terminal_open = false;
+        self.terminal_copy_mode = false;
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.terminal_selection_anchor = None;
+
+        self.git_panel_open = true;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.pending_branch_delete = None;
+        self.git_branch_input.clear();
+        self.git_commit_input.clear();
+
+        self.refresh()?;
+        self.set_status_info("Git panel open");
+        Ok(())
+    }
+
+    pub fn close_git_panel(&mut self) {
+        if self.git_panel_open {
+            self.git_panel_open = false;
+            self.git_panel_mode = GitPanelMode::Browse;
+            self.pending_branch_delete = None;
+            self.git_branch_input.clear();
+            self.git_commit_input.clear();
+            self.set_status_info("Git panel closed");
+        }
+    }
+
+    pub fn open_branch_create_prompt(&mut self) {
+        self.git_panel_mode = GitPanelMode::CreateBranch;
+        self.pending_branch_delete = None;
+        self.git_branch_input.clear();
+        self.set_status_info("Type a branch name and press Enter");
+    }
+
+    pub fn open_commit_prompt(&mut self) -> Result<()> {
+        self.settings_open = false;
+        self.terminal_open = false;
+        self.terminal_copy_mode = false;
+        self.terminal_search_open = false;
+        self.terminal_search_query.clear();
+        self.terminal_selection_anchor = None;
+
+        self.git_panel_open = true;
+        self.git_panel_mode = GitPanelMode::CommitMessage;
+        self.pending_branch_delete = None;
+        self.git_branch_input.clear();
+        self.git_commit_input.clear();
+
+        self.refresh()?;
+        self.set_status_info("Write commit message and press Enter");
+        Ok(())
+    }
+
+    pub fn cancel_git_prompt(&mut self) {
+        match self.git_panel_mode {
+            GitPanelMode::Browse => self.close_git_panel(),
+            GitPanelMode::CreateBranch => {
+                self.git_panel_mode = GitPanelMode::Browse;
+                self.git_branch_input.clear();
+                self.set_status_info("Create branch cancelled");
+            }
+            GitPanelMode::CommitMessage => {
+                self.git_panel_mode = GitPanelMode::Browse;
+                self.git_commit_input.clear();
+                self.set_status_info("Commit cancelled");
+            }
+            GitPanelMode::ConfirmDeleteBranch => {
+                self.git_panel_mode = GitPanelMode::Browse;
+                self.pending_branch_delete = None;
+                self.set_status_info("Delete branch cancelled");
+            }
+        }
+    }
+
+    pub fn move_branch_selection(&mut self, delta: isize) {
+        let len = self.branches.len();
+        if len == 0 {
+            self.branch_selected = None;
+            return;
+        }
+
+        let current = self.branch_selected.unwrap_or(0).min(len - 1);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current + delta as usize).min(len - 1)
+        };
+
+        self.branch_selected = Some(next);
+    }
+
+    pub fn git_branch_input_append(&mut self, ch: char) {
+        self.git_branch_input.push(ch);
+    }
+
+    pub fn git_branch_input_backspace(&mut self) {
+        self.git_branch_input.pop();
+    }
+
+    pub fn submit_new_branch(&mut self) -> Result<()> {
+        let branch_name = self.git_branch_input.trim().to_owned();
+        if branch_name.is_empty() {
+            self.set_status_warn("Branch name is empty");
+            return Ok(());
+        }
+
+        git::create_branch(&self.repo_root, &branch_name)?;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.pending_branch_delete = None;
+        self.git_branch_input.clear();
+        self.refresh()?;
+        self.set_status_info(format!("Created and switched to {branch_name}"));
+        Ok(())
+    }
+
+    pub fn switch_to_selected_branch(&mut self) -> Result<()> {
+        let Some(branch) = self.selected_branch().cloned() else {
+            self.set_status_warn("No branch selected");
+            return Ok(());
+        };
+
+        if branch.current {
+            self.set_status_info(format!("Already on {}", branch.name));
+            return Ok(());
+        }
+
+        git::switch_branch(&self.repo_root, &branch.name)?;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.pending_branch_delete = None;
+        self.refresh()?;
+        self.set_status_info(format!("Switched to {}", branch.name));
+        Ok(())
+    }
+
+    pub fn request_delete_selected_branch(&mut self) {
+        let Some(branch_name) = self.selected_branch_name().map(ToOwned::to_owned) else {
+            self.set_status_warn("No branch selected");
+            return;
+        };
+
+        let is_current = self
+            .selected_branch()
+            .map(|branch| branch.current)
+            .unwrap_or(false);
+        if is_current {
+            self.set_status_warn("Cannot delete the current branch");
+            return;
+        }
+
+        self.pending_branch_delete = Some(branch_name.clone());
+        self.git_panel_mode = GitPanelMode::ConfirmDeleteBranch;
+        self.set_status_warn(format!("Delete branch {}? Press y to confirm", branch_name));
+    }
+
+    pub fn confirm_delete_selected_branch(&mut self) -> Result<()> {
+        let Some(branch_name) = self.pending_branch_delete.clone() else {
+            self.git_panel_mode = GitPanelMode::Browse;
+            return Ok(());
+        };
+
+        git::delete_branch(&self.repo_root, &branch_name)?;
+        self.pending_branch_delete = None;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.refresh()?;
+        self.set_status_info(format!("Deleted branch {branch_name}"));
+        Ok(())
+    }
+
+    pub fn git_commit_input_append(&mut self, ch: char) {
+        self.git_commit_input.push(ch);
+    }
+
+    pub fn git_commit_input_backspace(&mut self) {
+        self.git_commit_input.pop();
+    }
+
+    pub fn submit_commit(&mut self) -> Result<()> {
+        if self.staged.is_empty() {
+            self.set_status_warn("No staged files to commit");
+            return Ok(());
+        }
+
+        let message = self.git_commit_input.trim().to_owned();
+        if message.is_empty() {
+            self.set_status_warn("Commit message is empty");
+            return Ok(());
+        }
+
+        git::commit(&self.repo_root, &message)?;
+        self.pending_branch_delete = None;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.git_commit_input.clear();
+        self.refresh()?;
+        self.set_status_info(format!("Committed: {message}"));
+        Ok(())
+    }
+
+    pub fn current_branch_name(&self) -> Option<&str> {
+        self.branches
+            .iter()
+            .find(|branch| branch.current)
+            .map(|branch| branch.name.as_str())
+    }
+
+    pub fn selected_branch_name(&self) -> Option<&str> {
+        self.selected_branch().map(|branch| branch.name.as_str())
+    }
+
+    pub fn pending_branch_delete_name(&self) -> Option<&str> {
+        self.pending_branch_delete.as_deref()
+    }
+
     pub fn open_terminal(&mut self) -> Result<()> {
         self.settings_open = false;
+        self.git_panel_open = false;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.pending_branch_delete = None;
+        self.git_branch_input.clear();
+        self.git_commit_input.clear();
         self.terminal_open = true;
         self.terminal_copy_mode = false;
         self.terminal_search_open = false;
@@ -737,6 +988,11 @@ impl App {
         self.terminal_search_open = false;
         self.terminal_search_query.clear();
         self.terminal_selection_anchor = None;
+        self.git_panel_open = false;
+        self.git_panel_mode = GitPanelMode::Browse;
+        self.pending_branch_delete = None;
+        self.git_branch_input.clear();
+        self.git_commit_input.clear();
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.set_status_info("Settings open");
@@ -1216,6 +1472,10 @@ impl App {
             .and_then(|idx| self.staged.get(idx).map(String::as_str))
     }
 
+    fn selected_branch(&self) -> Option<&BranchEntry> {
+        self.branch_selected.and_then(|idx| self.branches.get(idx))
+    }
+
     fn restore_unstaged_selection(&mut self, preferred_path: Option<String>) {
         if self.unstaged.is_empty() {
             self.unstaged_selected = None;
@@ -1260,6 +1520,32 @@ impl App {
         }
 
         self.staged_selected = Some(0);
+    }
+
+    fn restore_branch_selection(&mut self, preferred_branch: Option<String>) {
+        if self.branches.is_empty() {
+            self.branch_selected = None;
+            return;
+        }
+
+        if let Some(branch) = preferred_branch
+            && let Some(idx) = self.branches.iter().position(|entry| entry.name == branch)
+        {
+            self.branch_selected = Some(idx);
+            return;
+        }
+
+        if let Some(idx) = self.branch_selected
+            && idx < self.branches.len()
+        {
+            return;
+        }
+
+        self.branch_selected = self
+            .branches
+            .iter()
+            .position(|entry| entry.current)
+            .or(Some(0));
     }
 
     fn normalize_focus(&mut self) {

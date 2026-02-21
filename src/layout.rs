@@ -6,6 +6,8 @@ use crate::settings::{self, AppSettings, SidebarPosition};
 pub const MIN_DIFF_WIDTH_WITH_SIDEBAR: u16 = 48;
 pub const TERMINAL_MODAL_WIDTH_PERCENT: u16 = 92;
 pub const TERMINAL_MODAL_HEIGHT_PERCENT: u16 = 82;
+pub const GIT_MODAL_WIDTH_PERCENT: u16 = 72;
+pub const GIT_MODAL_HEIGHT_PERCENT: u16 = 72;
 pub const SETTINGS_MODAL_WIDTH_PERCENT: u16 = 70;
 pub const SETTINGS_MODAL_HEIGHT_PERCENT: u16 = 60;
 
@@ -112,6 +114,10 @@ pub fn settings_popup(area: Rect) -> Rect {
         SETTINGS_MODAL_HEIGHT_PERCENT,
         area,
     )
+}
+
+pub fn git_popup(area: Rect) -> Rect {
+    centered_rect(GIT_MODAL_WIDTH_PERCENT, GIT_MODAL_HEIGHT_PERCENT, area)
 }
 
 pub fn terminal_output_area(area: Rect) -> Rect {
