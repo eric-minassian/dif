@@ -18,7 +18,11 @@ mod status;
 mod util;
 
 pub use status::{StatusKind, StatusMessage};
-use util::{contains, ensure_visible, find_query_in_line, order_positions, shift_and_clamp_u16};
+use util::{
+    clamp_text_cursor, contains, ensure_visible, find_query_in_line, move_text_cursor_down,
+    move_text_cursor_end, move_text_cursor_home, move_text_cursor_up, next_text_cursor,
+    order_positions, prev_text_cursor, shift_and_clamp_u16,
+};
 
 const SETTINGS_FIELD_COUNT: usize = 7;
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
@@ -98,6 +102,7 @@ pub struct App {
     pub branch_selected: Option<usize>,
     pub git_branch_input: String,
     pub git_commit_input: String,
+    git_commit_cursor: usize,
     pub terminal_open: bool,
     pub terminal_scrollback: usize,
     pub terminal_copy_mode: bool,
@@ -151,6 +156,7 @@ impl App {
             branch_selected: None,
             git_branch_input: String::new(),
             git_commit_input: String::new(),
+            git_commit_cursor: 0,
             terminal_open: false,
             terminal_scrollback: 0,
             terminal_copy_mode: false,
@@ -457,6 +463,7 @@ impl App {
         self.pending_branch_delete = None;
         self.git_branch_input.clear();
         self.git_commit_input.clear();
+        self.git_commit_cursor = 0;
 
         self.refresh()?;
         self.set_status_info("Git panel open");
@@ -470,6 +477,7 @@ impl App {
             self.pending_branch_delete = None;
             self.git_branch_input.clear();
             self.git_commit_input.clear();
+            self.git_commit_cursor = 0;
             self.set_status_info("Git panel closed");
         }
     }
@@ -493,10 +501,12 @@ impl App {
         self.git_panel_mode = GitPanelMode::CommitMessage;
         self.pending_branch_delete = None;
         self.git_branch_input.clear();
-        self.git_commit_input.clear();
+        let template = git::commit_template(&self.repo_root)?.unwrap_or_default();
+        self.git_commit_input = normalize_newlines(&template);
+        self.git_commit_cursor = initial_commit_cursor(&self.git_commit_input);
 
         self.refresh()?;
-        self.set_status_info("Write commit message and press Enter");
+        self.set_status_info("Compose commit message (arrows move, Enter newline, Ctrl+S commit)");
         Ok(())
     }
 
@@ -511,6 +521,7 @@ impl App {
             GitPanelMode::CommitMessage => {
                 self.git_panel_mode = GitPanelMode::Browse;
                 self.git_commit_input.clear();
+                self.git_commit_cursor = 0;
                 self.set_status_info("Commit cancelled");
             }
             GitPanelMode::ConfirmDeleteBranch => {
@@ -616,11 +627,67 @@ impl App {
     }
 
     pub fn git_commit_input_append(&mut self, ch: char) {
-        self.git_commit_input.push(ch);
+        let cursor = clamp_text_cursor(&self.git_commit_input, self.git_commit_cursor);
+        self.git_commit_input.insert(cursor, ch);
+        self.git_commit_cursor = cursor + ch.len_utf8();
     }
 
     pub fn git_commit_input_backspace(&mut self) {
-        self.git_commit_input.pop();
+        let cursor = clamp_text_cursor(&self.git_commit_input, self.git_commit_cursor);
+        if cursor == 0 {
+            self.git_commit_cursor = 0;
+            return;
+        }
+
+        let prev = prev_text_cursor(&self.git_commit_input, cursor);
+        self.git_commit_input.replace_range(prev..cursor, "");
+        self.git_commit_cursor = prev;
+    }
+
+    pub fn git_commit_input_newline(&mut self) {
+        self.git_commit_input_append('\n');
+    }
+
+    pub fn git_commit_input_append_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let cursor = clamp_text_cursor(&self.git_commit_input, self.git_commit_cursor);
+        self.git_commit_input.insert_str(cursor, text);
+        self.git_commit_cursor = cursor + text.len();
+    }
+
+    pub fn git_commit_move_cursor_left(&mut self) {
+        self.git_commit_cursor = prev_text_cursor(&self.git_commit_input, self.git_commit_cursor);
+    }
+
+    pub fn git_commit_move_cursor_right(&mut self) {
+        self.git_commit_cursor = next_text_cursor(&self.git_commit_input, self.git_commit_cursor);
+    }
+
+    pub fn git_commit_move_cursor_up(&mut self) {
+        self.git_commit_cursor =
+            move_text_cursor_up(&self.git_commit_input, self.git_commit_cursor);
+    }
+
+    pub fn git_commit_move_cursor_down(&mut self) {
+        self.git_commit_cursor =
+            move_text_cursor_down(&self.git_commit_input, self.git_commit_cursor);
+    }
+
+    pub fn git_commit_move_cursor_home(&mut self) {
+        self.git_commit_cursor =
+            move_text_cursor_home(&self.git_commit_input, self.git_commit_cursor);
+    }
+
+    pub fn git_commit_move_cursor_end(&mut self) {
+        self.git_commit_cursor =
+            move_text_cursor_end(&self.git_commit_input, self.git_commit_cursor);
+    }
+
+    pub fn git_commit_cursor(&self) -> usize {
+        clamp_text_cursor(&self.git_commit_input, self.git_commit_cursor)
     }
 
     pub fn submit_commit(&mut self) -> Result<()> {
@@ -629,18 +696,21 @@ impl App {
             return Ok(());
         }
 
-        let message = self.git_commit_input.trim().to_owned();
-        if message.is_empty() {
-            self.set_status_warn("Commit message is empty");
-            return Ok(());
-        }
+        let message = self.git_commit_input.clone();
 
         git::commit(&self.repo_root, &message)?;
         self.pending_branch_delete = None;
         self.git_panel_mode = GitPanelMode::Browse;
         self.git_commit_input.clear();
+        self.git_commit_cursor = 0;
         self.refresh()?;
-        self.set_status_info(format!("Committed: {message}"));
+
+        let subject = message
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or("(no subject)");
+        self.set_status_info(format!("Committed: {subject}"));
         Ok(())
     }
 
@@ -666,6 +736,7 @@ impl App {
         self.pending_branch_delete = None;
         self.git_branch_input.clear();
         self.git_commit_input.clear();
+        self.git_commit_cursor = 0;
         self.terminal_open = true;
         self.terminal_copy_mode = false;
         self.terminal_search_open = false;
@@ -974,6 +1045,15 @@ impl App {
         (self.terminal_cursor_row, self.terminal_cursor_col)
     }
 
+    pub fn terminal_shell_cursor(&self) -> Option<(usize, usize)> {
+        let session = self.terminal_session.as_ref()?;
+        if session.cursor_hidden() {
+            None
+        } else {
+            Some(session.cursor_position())
+        }
+    }
+
     pub fn terminal_selection_rows(&self) -> Option<(usize, usize)> {
         self.terminal_selection_anchor.map(|(anchor_row, _)| {
             let start = anchor_row.min(self.terminal_cursor_row);
@@ -993,6 +1073,7 @@ impl App {
         self.pending_branch_delete = None;
         self.git_branch_input.clear();
         self.git_commit_input.clear();
+        self.git_commit_cursor = 0;
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.set_status_info("Settings open");
@@ -1602,4 +1683,28 @@ impl App {
             FocusSection::Staged => self.staged_selected = value,
         }
     }
+}
+
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn initial_commit_cursor(template: &str) -> usize {
+    if template.is_empty() {
+        return 0;
+    }
+
+    let mut line_start = 0usize;
+    for line in template.split('\n') {
+        let line_end = line_start + line.len();
+        if !line.trim_start().starts_with('#') {
+            if line.trim().is_empty() {
+                return line_start;
+            }
+            return line_end;
+        }
+        line_start = line_end.saturating_add(1);
+    }
+
+    0
 }

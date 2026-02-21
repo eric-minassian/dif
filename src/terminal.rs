@@ -216,6 +216,15 @@ impl TerminalSession {
         screen.rows(0, cols).collect()
     }
 
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let (row, col) = self.parser.screen().cursor_position();
+        (row as usize, col as usize)
+    }
+
+    pub fn cursor_hidden(&self) -> bool {
+        self.parser.screen().hide_cursor()
+    }
+
     pub fn is_exited(&self) -> bool {
         self.exited
     }

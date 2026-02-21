@@ -37,7 +37,16 @@ pub(crate) fn render_terminal_modal(frame: &mut Frame, app: &App, area: Rect, pa
         ])
         .split(inner);
 
-    let (cursor_row, cursor_col) = app.terminal_cursor();
+    let copy_cursor = app.terminal_cursor();
+    let shell_cursor = app.terminal_shell_cursor();
+    let cursor_text = if app.terminal_copy_mode {
+        format!("{}:{}", copy_cursor.0 + 1, copy_cursor.1 + 1)
+    } else if let Some((row, col)) = shell_cursor {
+        format!("{}:{}", row + 1, col + 1)
+    } else {
+        String::from("hidden")
+    };
+
     let mode = if app.terminal_copy_mode {
         "COPY"
     } else {
@@ -49,18 +58,23 @@ pub(crate) fn render_terminal_modal(frame: &mut Frame, app: &App, area: Rect, pa
         .unwrap_or_default();
 
     let header = Paragraph::new(format!(
-        "repo: {}  |  mode: {}  |  scrollback: {}  |  cursor: {}:{}{}",
+        "repo: {}  |  mode: {}  |  scrollback: {}  |  cursor: {}{}",
         app.repo_root_display(),
         mode,
         app.terminal_scrollback,
-        cursor_row + 1,
-        cursor_col + 1,
+        cursor_text,
         selection
     ))
     .style(Style::default().fg(rgb(palette.dim)));
     frame.render_widget(header, sections[0]);
 
     let terminal_rows = app.terminal_rows();
+    let render_cursor = if app.terminal_copy_mode {
+        Some(copy_cursor)
+    } else {
+        shell_cursor
+    };
+
     let output_lines: Vec<Line<'static>> = if terminal_rows.is_empty() {
         vec![Line::styled(
             "(waiting for terminal output)",
@@ -70,7 +84,7 @@ pub(crate) fn render_terminal_modal(frame: &mut Frame, app: &App, area: Rect, pa
         terminal_rows
             .into_iter()
             .enumerate()
-            .map(|(row_idx, row)| terminal_row_to_line(row, row_idx, app, palette))
+            .map(|(row_idx, row)| terminal_row_to_line(row, row_idx, app, palette, render_cursor))
             .collect()
     };
 
@@ -182,47 +196,67 @@ pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette
     .style(Style::default().fg(rgb(palette.dim)));
     frame.render_widget(header, sections[0]);
 
-    let mut branch_lines = Vec::new();
-    if app.branches.is_empty() {
-        branch_lines.push(Line::styled(
-            "(no local branches)",
-            Style::default().fg(rgb(palette.dim)),
-        ));
-    } else {
-        for (idx, branch) in app.branches.iter().enumerate() {
-            let prefix = if app.branch_selected == Some(idx) {
-                ">"
-            } else {
-                " "
-            };
-            let marker = if branch.current { "*" } else { " " };
-            let style = if app.branch_selected == Some(idx) {
-                Style::default()
-                    .fg(rgb(palette.text))
-                    .bg(rgb(palette.modal_selected_bg))
-                    .add_modifier(Modifier::BOLD)
-            } else if branch.current {
-                Style::default().fg(rgb(palette.border_focus))
-            } else {
-                Style::default().fg(rgb(palette.text))
-            };
-
-            branch_lines.push(Line::styled(
-                format!("{prefix} {marker} {}", branch.name),
-                style,
-            ));
-        }
-    }
-
-    let branches = Paragraph::new(Text::from(branch_lines))
+    if app.git_panel_mode == GitPanelMode::CommitMessage {
+        let editor = Paragraph::new(Text::from(commit_editor_lines(
+            &app.git_commit_input,
+            app.git_commit_cursor(),
+            palette,
+        )))
         .block(
             Block::default()
-                .title(" Branches ")
+                .title(" Commit Message ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(rgb(palette.modal_border))),
         )
-        .style(Style::default().bg(rgb(palette.modal_bg)));
-    frame.render_widget(branches, sections[1]);
+        .style(
+            Style::default()
+                .bg(rgb(palette.modal_bg))
+                .fg(rgb(palette.text)),
+        );
+        frame.render_widget(editor, sections[1]);
+    } else {
+        let mut branch_lines = Vec::new();
+        if app.branches.is_empty() {
+            branch_lines.push(Line::styled(
+                "(no local branches)",
+                Style::default().fg(rgb(palette.dim)),
+            ));
+        } else {
+            for (idx, branch) in app.branches.iter().enumerate() {
+                let prefix = if app.branch_selected == Some(idx) {
+                    ">"
+                } else {
+                    " "
+                };
+                let marker = if branch.current { "*" } else { " " };
+                let style = if app.branch_selected == Some(idx) {
+                    Style::default()
+                        .fg(rgb(palette.text))
+                        .bg(rgb(palette.modal_selected_bg))
+                        .add_modifier(Modifier::BOLD)
+                } else if branch.current {
+                    Style::default().fg(rgb(palette.border_focus))
+                } else {
+                    Style::default().fg(rgb(palette.text))
+                };
+
+                branch_lines.push(Line::styled(
+                    format!("{prefix} {marker} {}", branch.name),
+                    style,
+                ));
+            }
+        }
+
+        let branches = Paragraph::new(Text::from(branch_lines))
+            .block(
+                Block::default()
+                    .title(" Branches ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(rgb(palette.modal_border))),
+            )
+            .style(Style::default().bg(rgb(palette.modal_bg)));
+        frame.render_widget(branches, sections[1]);
+    }
 
     let footer_lines = match app.git_panel_mode {
         GitPanelMode::Browse => vec![
@@ -253,11 +287,11 @@ pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette
         ],
         GitPanelMode::CommitMessage => vec![
             Line::styled(
-                format!("commit message: {}_", app.git_commit_input),
-                Style::default().fg(rgb(palette.text)),
+                "Arrows move cursor, Enter newline, Ctrl+S commits, Esc cancels",
+                Style::default().fg(rgb(palette.dim)),
             ),
             Line::styled(
-                "Enter commits staged files, Esc cancels",
+                "Template loads automatically from git commit.template when configured",
                 Style::default().fg(rgb(palette.dim)),
             ),
         ],
@@ -284,12 +318,98 @@ pub(crate) fn render_git_modal(frame: &mut Frame, app: &App, area: Rect, palette
     frame.render_widget(footer, sections[2]);
 }
 
+fn commit_editor_lines(message: &str, cursor: usize, palette: &Palette) -> Vec<Line<'static>> {
+    let cursor = cursor.min(message.len());
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+
+    for line in message.split('\n') {
+        let line_end = line_start + line.len();
+        let cursor_col = if cursor >= line_start && cursor <= line_end {
+            Some(message[line_start..cursor].chars().count())
+        } else {
+            None
+        };
+
+        let base_style = if line.trim_start().starts_with('#') {
+            Style::default().fg(rgb(palette.dim))
+        } else {
+            Style::default().fg(rgb(palette.text))
+        };
+
+        lines.push(line_with_editor_cursor(
+            line, base_style, cursor_col, palette,
+        ));
+        line_start = line_end.saturating_add(1);
+    }
+
+    lines
+}
+
+fn line_with_editor_cursor(
+    line: &str,
+    base_style: Style,
+    cursor_col: Option<usize>,
+    palette: &Palette,
+) -> Line<'static> {
+    let Some(cursor_col) = cursor_col else {
+        return Line::styled(line.to_owned(), base_style);
+    };
+
+    let cursor_style = editor_cursor_style(palette);
+    let chars = line.chars().collect::<Vec<_>>();
+
+    if cursor_col >= chars.len() {
+        let mut spans = Vec::new();
+        if !line.is_empty() {
+            spans.push(Span::styled(line.to_owned(), base_style));
+        }
+        spans.push(Span::styled(" ", cursor_style));
+        return Line::from(spans);
+    }
+
+    let prefix = chars[..cursor_col].iter().collect::<String>();
+    let current = chars[cursor_col].to_string();
+    let suffix = chars[cursor_col + 1..].iter().collect::<String>();
+
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix, base_style));
+    }
+    spans.push(Span::styled(current, cursor_style));
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, base_style));
+    }
+
+    Line::from(spans)
+}
+
+fn editor_cursor_style(palette: &Palette) -> Style {
+    Style::default()
+        .fg(rgb(palette.modal_bg))
+        .bg(rgb(palette.border_focus))
+        .add_modifier(Modifier::BOLD)
+}
+
 fn terminal_row_to_line(
     row: TerminalStyledRow,
     row_idx: usize,
     app: &App,
     palette: &Palette,
+    terminal_cursor: Option<(usize, usize)>,
 ) -> Line<'static> {
+    let interactive_cursor_col = if app.terminal_copy_mode {
+        None
+    } else {
+        terminal_cursor.and_then(|(cursor_row, cursor_col)| {
+            if row_idx == cursor_row {
+                Some(cursor_col)
+            } else {
+                None
+            }
+        })
+    };
+
     if row.is_empty() {
         let mut empty = Line::from(Span::raw(String::new()));
         if app.terminal_copy_mode {
@@ -297,17 +417,22 @@ fn terminal_row_to_line(
             if row_idx == cursor_row {
                 empty = empty.style(Style::default().bg(rgb(palette.selected_bg_focused)));
             }
+        } else if interactive_cursor_col.is_some() {
+            empty = Line::from(Span::styled(" ", terminal_cursor_style(palette)));
         }
         return empty;
     }
 
-    let spans = row
-        .into_iter()
-        .map(|span| {
-            let style = style_from_terminal_cell(span.style, palette);
-            Span::styled(span.text, style)
-        })
-        .collect::<Vec<_>>();
+    let spans = if let Some(cursor_col) = interactive_cursor_col {
+        build_row_spans_with_cursor(row, cursor_col, palette)
+    } else {
+        row.into_iter()
+            .map(|span| {
+                let style = style_from_terminal_cell(span.style, palette);
+                Span::styled(span.text, style)
+            })
+            .collect::<Vec<_>>()
+    };
 
     let mut line = Line::from(spans);
     if app.terminal_copy_mode {
@@ -325,6 +450,64 @@ fn terminal_row_to_line(
     }
 
     line
+}
+
+fn build_row_spans_with_cursor(
+    row: TerminalStyledRow,
+    cursor_col: usize,
+    palette: &Palette,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cursor_drawn = false;
+    let mut col = 0usize;
+
+    for terminal_span in row {
+        let style = style_from_terminal_cell(terminal_span.style, palette);
+        let chars = terminal_span.text.chars().collect::<Vec<_>>();
+        let len = chars.len();
+
+        if !cursor_drawn && cursor_col >= col && cursor_col < col.saturating_add(len) {
+            let local_col = cursor_col - col;
+
+            if local_col > 0 {
+                spans.push(Span::styled(
+                    chars[..local_col].iter().collect::<String>(),
+                    style,
+                ));
+            }
+
+            spans.push(Span::styled(
+                chars[local_col].to_string(),
+                terminal_cursor_style(palette),
+            ));
+
+            if local_col + 1 < len {
+                spans.push(Span::styled(
+                    chars[local_col + 1..].iter().collect::<String>(),
+                    style,
+                ));
+            }
+
+            cursor_drawn = true;
+        } else if !terminal_span.text.is_empty() {
+            spans.push(Span::styled(terminal_span.text, style));
+        }
+
+        col = col.saturating_add(len);
+    }
+
+    if !cursor_drawn {
+        spans.push(Span::styled(" ", terminal_cursor_style(palette)));
+    }
+
+    spans
+}
+
+fn terminal_cursor_style(palette: &Palette) -> Style {
+    Style::default()
+        .fg(rgb(palette.modal_bg))
+        .bg(rgb(palette.border_focus))
+        .add_modifier(Modifier::BOLD)
 }
 
 fn style_from_terminal_cell(style: TerminalCellStyle, palette: &Palette) -> Style {

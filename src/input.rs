@@ -37,6 +37,8 @@ enum SettingsKeyAction {
     AdjustRight,
 }
 
+const FAST_TERMINAL_SCROLL_STEP: isize = 12;
+
 pub fn handle_event(app: &mut App, event: Event) -> bool {
     if app.has_pending_undo_confirmation() {
         if let Event::Key(key) = event
@@ -208,10 +210,24 @@ fn handle_git_panel_create_branch_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_git_panel_commit_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            run_action_with(app, App::submit_commit);
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => app.cancel_git_prompt(),
-        KeyCode::Enter => run_action_with(app, App::submit_commit),
+        KeyCode::Enter => app.git_commit_input_newline(),
+        KeyCode::Tab => app.git_commit_input_append('\t'),
         KeyCode::Backspace => app.git_commit_input_backspace(),
+        KeyCode::Left => app.git_commit_move_cursor_left(),
+        KeyCode::Right => app.git_commit_move_cursor_right(),
+        KeyCode::Up => app.git_commit_move_cursor_up(),
+        KeyCode::Down => app.git_commit_move_cursor_down(),
+        KeyCode::Home => app.git_commit_move_cursor_home(),
+        KeyCode::End => app.git_commit_move_cursor_end(),
         KeyCode::Char(ch)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -242,14 +258,14 @@ fn handle_git_panel_paste(app: &mut App, text: &str) {
             }
         }
         GitPanelMode::CommitMessage => {
-            for ch in text.chars() {
-                if ch != '\n' && ch != '\r' {
-                    app.git_commit_input_append(ch);
-                }
-            }
+            app.git_commit_input_append_text(&normalize_newlines(text));
         }
         GitPanelMode::Browse | GitPanelMode::ConfirmDeleteBranch => {}
     }
+}
+
+fn normalize_newlines(input: &str) -> String {
+    input.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn handle_pending_undo_key(app: &mut App, code: KeyCode) {
@@ -315,9 +331,23 @@ fn handle_terminal_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if key.code == KeyCode::Esc || is_terminal_close_chord(key) {
+    if is_terminal_close_chord(key) {
         app.close_terminal();
         return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Up => {
+                app.scroll_terminal(FAST_TERMINAL_SCROLL_STEP);
+                return;
+            }
+            KeyCode::Down => {
+                app.scroll_terminal(-FAST_TERMINAL_SCROLL_STEP);
+                return;
+            }
+            _ => {}
+        }
     }
 
     if key.modifiers.contains(KeyModifiers::ALT)
@@ -332,6 +362,20 @@ fn handle_terminal_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_terminal_copy_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Up => {
+                app.scroll_terminal(FAST_TERMINAL_SCROLL_STEP);
+                return;
+            }
+            KeyCode::Down => {
+                app.scroll_terminal(-FAST_TERMINAL_SCROLL_STEP);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char(keymap::KEY_TERMINAL_INTERACTIVE_MODE) => {
             app.terminal_exit_copy_mode()

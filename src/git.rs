@@ -1,5 +1,7 @@
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -195,17 +197,48 @@ pub fn delete_branch(repo_root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn commit_template(repo_root: &Path) -> Result<Option<String>> {
+    let output = run_git(repo_root, &["config", "--path", "--get", "commit.template"])?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let template_path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if template_path.is_empty() {
+        return Ok(None);
+    }
+
+    let template = fs::read_to_string(&template_path)
+        .with_context(|| format!("failed to read git commit template `{template_path}`"))?;
+    Ok(Some(template))
+}
+
 pub fn commit(repo_root: &Path, message: &str) -> Result<()> {
-    if message.trim().is_empty() {
+    if !has_meaningful_commit_content(message) {
         bail!("commit message cannot be empty");
     }
 
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .current_dir(repo_root)
-        .args(["commit", "-m"])
-        .arg(message)
-        .output()
-        .with_context(|| format!("failed to create commit `{message}`"))?;
+        .args(["commit", "--cleanup=strip", "-F", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .context("failed to start `git commit --cleanup=strip -F -`")?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(message.as_bytes())
+            .context("failed to write commit message to git")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git commit process")?;
 
     if !output.status.success() {
         bail!(git_error("create commit", &output));
@@ -420,9 +453,17 @@ fn git_error(action: &str, output: &Output) -> String {
     }
 }
 
+fn has_meaningful_commit_content(message: &str) -> bool {
+    message
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UnstagedKind, parse_branch_listing, parse_porcelain_status};
+    use super::{
+        UnstagedKind, has_meaningful_commit_content, parse_branch_listing, parse_porcelain_status,
+    };
 
     #[test]
     fn parses_staged_unstaged_and_untracked_entries() {
@@ -470,5 +511,15 @@ mod tests {
         assert!(branches[0].current);
         assert_eq!(branches[1].name, "hotfix");
         assert!(!branches[1].current);
+    }
+
+    #[test]
+    fn detects_meaningful_commit_content() {
+        assert!(has_meaningful_commit_content("subject\n\nbody"));
+        assert!(has_meaningful_commit_content("# comment\nactual"));
+        assert!(!has_meaningful_commit_content(
+            "# template line\n\n# another"
+        ));
+        assert!(!has_meaningful_commit_content("\n \n"));
     }
 }

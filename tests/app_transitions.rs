@@ -88,15 +88,34 @@ fn creates_switches_and_deletes_branches() {
 }
 
 #[test]
-fn creates_commit_with_message() {
+fn creates_multiline_commit_with_template() {
     let repo = setup_repo().expect("repo setup should succeed");
+
+    let template_path = repo.path().join(".gitmessage.txt");
+    fs::write(&template_path, "# Summary line\n\n# Body\n# - detail\n")
+        .expect("template write should succeed");
+    git(
+        repo.path(),
+        &[
+            "config",
+            "commit.template",
+            template_path
+                .to_str()
+                .expect("template path should be utf-8"),
+        ],
+    )
+    .expect("setting commit template should succeed");
+
     let mut app = App::new(repo.path().to_path_buf()).expect("app should initialize");
 
     app.open_commit_prompt()
         .expect("commit prompt should open successfully");
-    for ch in "add staged file".chars() {
-        app.git_commit_input_append(ch);
-    }
+    assert!(
+        app.git_commit_input.contains("# Summary line"),
+        "template should prefill commit input"
+    );
+
+    app.git_commit_input_append_text("add staged file\n\nBody line 1\nBody line 2\n");
     app.submit_commit().expect("commit should succeed");
 
     assert!(
@@ -107,6 +126,13 @@ fn creates_commit_with_message() {
     let output = git_output(repo.path(), &["log", "-1", "--pretty=%s"])
         .expect("git log should return latest commit subject");
     assert_eq!(output.trim(), "add staged file");
+
+    let full_message = git_output(repo.path(), &["log", "-1", "--pretty=%B"])
+        .expect("git log should return full commit message");
+    assert_eq!(
+        full_message.trim_end(),
+        "add staged file\n\nBody line 1\nBody line 2"
+    );
 }
 
 fn setup_repo() -> anyhow::Result<TempDir> {

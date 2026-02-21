@@ -47,12 +47,12 @@ pub fn footer_hint_git_panel() -> String {
 }
 
 pub fn footer_hint_terminal_copy() -> &'static str {
-    "copy mode: move(hjkl/arrows)  v mark  y copy  / search  n next  i interactive"
+    "copy: move(hjkl/arrows)  Shift+Up/Down fast scroll  v mark  y copy  / search  i shell"
 }
 
 pub fn footer_hint_terminal() -> String {
     format!(
-        "terminal: all keys -> shell, Esc close, Alt+{} copy mode, {} close",
+        "terminal: keys->shell, Shift+Up/Down scroll, Alt+{} copy, {} close",
         KEY_TERMINAL_COPY_MODE,
         terminal_close_hint()
     )
@@ -78,14 +78,14 @@ pub fn footer_hint_main() -> String {
 
 pub fn terminal_modal_interactive_hint() -> String {
     format!(
-        "interactive shell. Esc closes. Alt+{} enters copy mode. {} also close.",
+        "interactive shell. Shift+Up/Down scrolls faster. Alt+{} enters copy mode. {} close.",
         KEY_TERMINAL_COPY_MODE,
         terminal_close_hint()
     )
 }
 
 pub fn terminal_modal_copy_hint() -> &'static str {
-    "copy: hjkl/arrows move  v mark  y yank  / search  n next  i interactive"
+    "copy: hjkl/arrows move  Shift+Up/Down fast scroll  v mark  y yank  / search  n next  i shell"
 }
 
 #[cfg(test)]
